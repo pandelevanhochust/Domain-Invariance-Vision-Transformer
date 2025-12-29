@@ -1,0 +1,427 @@
+import sys
+import os
+import cv2
+import torch
+import timm
+import numpy as np
+import requests
+import torch.nn as nn
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                               QHBoxLayout, QLabel, QPushButton, QFileDialog,
+                               QTextEdit, QMessageBox)
+from PySide6.QtGui import QPixmap, QImage, QFont
+from PySide6.QtCore import Qt, QTimer
+from torchvision import transforms
+from PIL import Image
+from ultralytics import YOLO
+
+# --- 1. CONFIGURATION ---
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_FILENAME = "trained_model/yolo-divt_combined_final.pth"
+YOLO_WEIGHTS_PATH = "yolov8n-face.pt"
+SKIP_FRAMES = 5
+
+CLASS_MAP = {
+    0: 'Real Face (Selfie)',
+    1: '3D Paper Mask',
+    2: 'Cutout Attack',
+    3: 'Latex Mask',
+    4: 'Replay (Display)',
+    5: 'Replay (Mobile)',
+    6: 'Silicone Mask',
+    7: 'Textile Mask',
+    8: 'Wrapped 3D Mask'
+}
+
+def ensure_yolo_weights(path):
+    if not os.path.exists(path):
+        print(f"[INFO] {path} not found. Downloading generic yolov8n-face model...")
+        url = "https://github.com/akanametov/yolo-face/releases/download/v0.0.0/yolov8n-face.pt"
+        try:
+            r = requests.get(url, allow_redirects=True)
+            with open(path, 'wb') as f:
+                f.write(r.content)
+        except Exception as e:
+            print(f"[ERROR] Could not download weights: {e}")
+
+
+# --- 2. PREPROCESSING NODE (With Feedback Logic) ---
+class YoloPreprocessNode:
+    def __init__(self, weights_path, device):
+        ensure_yolo_weights(weights_path)
+        self.detector = YOLO(weights_path)
+
+        self.transform_norm = transforms.Normalize([0.5] * 3, [0.5] * 3)
+        self.to_tensor = transforms.ToTensor()
+        self.resize = transforms.Resize((224, 224))
+        self.device = device
+
+    def get_crop_coords(self, box, img_w, img_h, expansion=2.5):
+        x1, y1, x2, y2 = box
+        w = x2 - x1
+        h = y2 - y1
+        cx, cy = x1 + w // 2, y1 + h // 2
+
+        # Proportionate Background Expansion
+        max_side = max(w, h)
+        new_size = int(max_side * expansion)
+
+        x1_new = max(0, cx - new_size // 2)
+        y1_new = max(0, cy - new_size // 2)
+        x2_new = min(img_w, cx + new_size // 2)
+        y2_new = min(img_h, cy + new_size // 2)
+
+        return int(x1_new), int(y1_new), int(x2_new), int(y2_new)
+
+    def run(self, image_rgb):
+        """
+        Input: RGB Numpy Array
+        Output: Tuple (Tensor OR None, Status Message String)
+        """
+        if image_rgb is None: return None, "No Image"
+
+        try:
+            # Run YOLO
+            results = self.detector(image_rgb, verbose=False, conf=0.5)
+
+            if not results or len(results[0].boxes) == 0:
+                return None, "No Face Detected"
+
+            # Select Largest Face
+            boxes = results[0].boxes.xyxy.cpu().numpy()
+            areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+            best_idx = np.argmax(areas)
+            best_box = boxes[best_idx]
+
+            # Calculate Crop with High Expansion (2.5x)
+            h_img, w_img = image_rgb.shape[:2]
+            nx1, ny1, nx2, ny2 = self.get_crop_coords(best_box, w_img, h_img, expansion=2.5)
+
+            # --- VALIDATE MARGIN ---
+            face_w = best_box[2] - best_box[0]
+            face_h = best_box[3] - best_box[1]
+            max_face_dim = max(face_w, face_h)
+            actual_crop_dim = min(nx2 - nx1, ny2 - ny1)
+
+            # If crop is too small relative to face, user is too close
+            if actual_crop_dim < (max_face_dim * 1.5):
+                return None, "Face Too Close"
+
+            # Process Valid Crop
+            pil_img = Image.fromarray(image_rgb)
+            crop = pil_img.crop((nx1, ny1, nx2, ny2))
+
+            crop = self.resize(crop)
+            tensor = self.to_tensor(crop)
+            tensor = self.transform_norm(tensor)
+
+            return tensor.unsqueeze(0).to(self.device), "OK"
+
+        except Exception as e:
+            print(f"Preprocess Error: {e}")
+            return None, "Error"
+
+
+# --- 3. MODEL DEFINITION ---
+class MultiTaskDiVT(nn.Module):
+    def __init__(self, num_attack_classes=9, pretrained=False):
+        super(MultiTaskDiVT, self).__init__()
+        self.backbone = timm.create_model('vit_base_patch16_224', pretrained=False, num_classes=0)
+        embed_dim = self.backbone.num_features
+
+        self.liveness_head = nn.Sequential(
+            nn.Linear(embed_dim, 256), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(256, 1), nn.Sigmoid()
+        )
+        self.attack_head = nn.Sequential(
+            nn.Linear(embed_dim, 256), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(256, num_attack_classes)
+        )
+
+    def forward(self, x):
+        features = self.backbone(x)
+        return self.liveness_head(features), self.attack_head(features)
+
+
+# --- 4. MAIN WINDOW UI ---
+class AntiSpoofApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("DiVT Anti-Spoofing Detector (Live Feedback)")
+        self.setGeometry(100, 100, 1000, 800)
+
+        # State variables
+        self.model = None
+        self.preprocess_node = None
+        self.cap = None
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.next_frame)
+        self.frame_counter = 0
+        self.is_playing = False
+        self.is_webcam = False
+        self.current_frame = None
+        self.current_rotation = 0
+
+        # --- UI LAYOUT ---
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout(central_widget)
+
+        # LEFT PANEL
+        left_panel = QVBoxLayout()
+
+        self.lbl_status = QLabel("Status: Initializing...")
+        self.lbl_status.setStyleSheet("font-weight: bold; color: gray;")
+
+        self.btn_load_file = QPushButton("📂 Load Image/Video")
+        self.btn_load_file.clicked.connect(self.load_media_file)
+        self.btn_load_file.setEnabled(False)
+
+        self.btn_live_cam = QPushButton("📹 Switch to Live Camera")
+        self.btn_live_cam.clicked.connect(self.start_webcam)
+        self.btn_live_cam.setEnabled(False)
+        self.btn_live_cam.setStyleSheet("background-color: #6c757d; color: white; padding: 8px;")
+
+        # ROTATION BUTTONS
+        rotate_layout = QHBoxLayout()
+        self.btn_rot_left = QPushButton("↺ Left")
+        self.btn_rot_left.clicked.connect(lambda: self.rotate_media(-90))
+        self.btn_rot_right = QPushButton("↻ Right")
+        self.btn_rot_right.clicked.connect(lambda: self.rotate_media(90))
+        rotate_layout.addWidget(self.btn_rot_left)
+        rotate_layout.addWidget(self.btn_rot_right)
+
+        self.result_box = QTextEdit()
+        self.result_box.setReadOnly(True)
+        self.result_box.setStyleSheet("font-size: 14px; padding: 10px;")
+
+        left_panel.addWidget(self.lbl_status)
+        left_panel.addWidget(self.btn_load_file)
+        left_panel.addWidget(self.btn_live_cam)
+        left_panel.addLayout(rotate_layout)
+        left_panel.addWidget(QLabel("<b>Live Result:</b>"))
+        left_panel.addWidget(self.result_box)
+
+        # RIGHT PANEL
+        right_panel = QVBoxLayout()
+        self.image_display = QLabel("Select Source")
+        self.image_display.setAlignment(Qt.AlignCenter)
+        self.image_display.setStyleSheet("border: 2px dashed #aaa; background-color: #000; color: #fff;")
+        self.image_display.setMinimumSize(500, 400)
+
+        self.btn_process = QPushButton("▶ Play / Detect")
+        self.btn_process.setStyleSheet("background-color: #007bff; color: white; font-weight: bold; padding: 12px;")
+        self.btn_process.clicked.connect(self.toggle_playback)
+        self.btn_process.setEnabled(False)
+
+        right_panel.addWidget(self.image_display)
+        right_panel.addWidget(self.btn_process)
+
+        main_layout.addLayout(left_panel, 3)
+        main_layout.addLayout(right_panel, 7)
+
+        self.init_system()
+
+    def init_system(self):
+        if not os.path.exists(MODEL_FILENAME):
+            self.lbl_status.setText(f"Status: '{MODEL_FILENAME}' Missing!")
+            self.lbl_status.setStyleSheet("color: red; font-weight: bold;")
+            return
+
+        try:
+            self.lbl_status.setText("Status: Loading AI Models...")
+            QApplication.processEvents()
+
+            # 1. Load DiVT Model
+            self.model = MultiTaskDiVT(num_attack_classes=9)
+            state_dict = torch.load(MODEL_FILENAME, map_location=DEVICE)
+            self.model.load_state_dict(state_dict)
+            self.model.to(DEVICE)
+            self.model.eval()
+
+            # 2. Load YOLO Preprocessor
+            self.preprocess_node = YoloPreprocessNode(YOLO_WEIGHTS_PATH, DEVICE)
+
+            self.lbl_status.setText(f"Status: Ready ({DEVICE})")
+            self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
+            self.btn_load_file.setEnabled(True)
+            self.btn_live_cam.setEnabled(True)
+
+        except Exception as e:
+            self.lbl_status.setText("Status: Error Loading Model")
+            self.result_box.setText(f"ERROR:\n{str(e)}")
+            print(e)
+
+    def rotate_media(self, angle):
+        self.current_rotation = (self.current_rotation + angle) % 360
+        if self.current_frame is not None and not self.is_playing:
+            rotated_frame = self.apply_rotation(self.current_frame)
+            self.display_image(rotated_frame)
+
+    def apply_rotation(self, img_array):
+        if self.current_rotation == 0:
+            return img_array
+        elif self.current_rotation == 90:
+            return cv2.rotate(img_array, cv2.ROTATE_90_CLOCKWISE)
+        elif self.current_rotation == 180:
+            return cv2.rotate(img_array, cv2.ROTATE_180)
+        elif self.current_rotation == 270:
+            return cv2.rotate(img_array, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return img_array
+
+    def load_media_file(self):
+        file_name, _ = QFileDialog.getOpenFileName(self, "Select Media", "",
+                                                   "Files (*.png *.jpg *.jpeg *.mp4 *.avi *.mov)")
+        if not file_name: return
+
+        self.stop_playback()
+        self.result_box.clear()
+        self.is_webcam = False
+        self.current_rotation = 0
+
+        if file_name.lower().endswith(('.mp4', '.avi', '.mov')):
+            self.cap = cv2.VideoCapture(file_name)
+            self.is_video = True
+            ret, frame = self.cap.read()
+            if ret:
+                self.current_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                self.display_image(self.apply_rotation(self.current_frame))
+                self.result_box.setText(f"Loaded Video: {os.path.basename(file_name)}")
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        else:
+            self.is_video = False
+            self.cap = None
+            try:
+                img = Image.open(file_name).convert('RGB')
+                self.current_frame = np.array(img)
+                self.display_image(self.apply_rotation(self.current_frame))
+                self.result_box.setText(f"Loaded Image: {os.path.basename(file_name)}")
+            except:
+                pass
+
+        self.btn_process.setEnabled(True)
+        self.btn_process.setText("Play / Detect" if self.is_video else "Run Detection")
+
+    def start_webcam(self):
+        self.stop_playback()
+        self.result_box.clear()
+        self.is_webcam = True
+        self.is_video = True
+        self.current_rotation = 0
+        self.cap = cv2.VideoCapture(0)
+
+        if not self.cap.isOpened():
+            self.result_box.setText("❌ Error: Could not open webcam.")
+            return
+
+        self.start_playback()
+
+    def toggle_playback(self):
+        if self.is_video:
+            if self.is_playing:
+                self.stop_playback()
+            else:
+                self.start_playback()
+        else:
+            # Single image inference
+            rotated = self.apply_rotation(self.current_frame)
+            self.run_inference(rotated)
+
+    def start_playback(self):
+        if not self.cap: return
+        self.is_playing = True
+        self.btn_process.setText("⏸ Stop")
+        self.timer.start(30)
+
+    def stop_playback(self):
+        self.is_playing = False
+        self.timer.stop()
+        self.btn_process.setText("▶ Play / Detect" if not self.is_webcam else "▶ Resume Camera")
+
+    def next_frame(self):
+        if not self.cap: return
+
+        ret, frame = self.cap.read()
+        if not ret:
+            if self.is_webcam: print("Webcam disconnected.")
+            self.stop_playback()
+            if not self.is_webcam: self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            return
+
+        if self.is_webcam:
+            frame = cv2.flip(frame, 1)
+
+        self.current_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rotated_frame = self.apply_rotation(self.current_frame)
+        self.display_image(rotated_frame)
+
+        self.frame_counter += 1
+        if self.frame_counter % SKIP_FRAMES == 0:
+            self.run_inference(rotated_frame)
+
+    def run_inference(self, img_rgb):
+        if self.model is None or self.preprocess_node is None: return
+
+        try:
+            #
+            # Use the new signature that returns (Tensor, Message)
+            face_tensor, status_msg = self.preprocess_node.run(img_rgb)
+
+            # --- HANDLE FEEDBACK ---
+            if face_tensor is None:
+                # Case A: User is too close
+                if "Too Close" in status_msg:
+                    self.result_box.setHtml(
+                        "<h2 style='color:orange; text-align:center;'>⚠️ Face Too Close!</h2>"
+                        "<p style='text-align:center; font-size:16px;'>Please move backward to capture background.</p>"
+                    )
+                # Case B: No face at all
+                else:
+                    self.result_box.setHtml("<h3 style='color:gray; text-align:center;'>Scanning...</h3>")
+                return
+
+            # --- RUN MODEL ---
+            with torch.no_grad():
+                liveness_prob, attack_logits = self.model(face_tensor)
+
+                is_real = liveness_prob.item() > 0.5
+                conf = liveness_prob.item() if is_real else 1 - liveness_prob.item()
+                attack_idx = torch.argmax(attack_logits, dim=1).item()
+                attack_name = CLASS_MAP.get(attack_idx, "Unknown")
+
+                status = "REAL" if is_real else "FAKE"
+                color = "green" if is_real else "red"
+
+                html = f"""
+                <h2 style="color:{color}; text-align:center;">{status}</h2>
+                <p><b>Confidence:</b> {conf * 100:.1f}%</p>
+                <p><b>Type:</b> {attack_name}</p>
+                """
+                self.result_box.setHtml(html)
+
+        except Exception as e:
+            print(f"Inference Error: {e}")
+
+    def display_image(self, img_array):
+        if img_array is None or img_array.size == 0: return
+
+        height, width, channel = img_array.shape
+        bytes_per_line = 3 * width
+        q_img = QImage(img_array.data, width, height, bytes_per_line, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(q_img)
+        scaled_pixmap = pixmap.scaled(self.image_display.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.image_display.setPixmap(scaled_pixmap)
+
+    def closeEvent(self, event):
+        if self.cap:
+            self.cap.release()
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    font = QFont("Segoe UI", 10)
+    app.setFont(font)
+    window = AntiSpoofApp()
+    window.show()
+    sys.exit(app.exec())
