@@ -13,6 +13,10 @@ from PIL import Image
 from ultralytics import YOLO
 from plotter import save_training_graphs
 
+#Tiep theo: tiep can cac kieu tan cong khac
+# Phan tich anh that anh gia khac nhau the nao: nhieu kieu tan cong khac nhahu
+# Bien doi Fourier
+
 # --- 1. Configuration ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 32
