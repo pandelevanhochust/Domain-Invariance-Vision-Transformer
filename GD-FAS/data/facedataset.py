@@ -45,7 +45,17 @@ class FaceDataset(Dataset):
         spoofing_label = int('live' in video_name)
         # Handle both Unix and Windows path separators
         path_parts = video_name.replace('\\', '/').split('/')
-        domain_label = self.data_names[path_parts[1] if len(path_parts) > 1 else path_parts[0]]
+        # domain_label = self.data_names[path_parts[1] if len(path_parts) > 1 else path_parts[0]]
+
+        domain_label = -1
+        for part in path_parts:
+            if part in self.data_names:
+                domain_label = self.data_names[part]
+                break
+
+        if domain_label == -1:
+            domain_label = list(self.data_names.values())[0]
+
         image_x = self.sample_image(video_name)
         image_x = self.transform(image_x)
 
