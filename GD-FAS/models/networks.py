@@ -1,12 +1,13 @@
+from collections import OrderedDict
+
+import numpy as np
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision, torch
-import numpy as np
-
-from models.clip.clip import load, tokenize
-from collections import OrderedDict
+import torchvision
+from .clip.clip import load, tokenize
 from scipy import optimize
-from utils import centroid_calculate_function
+
 
 class AverageMeter(object):
     def __init__(self):
@@ -123,8 +124,9 @@ class resnet(nn.Module):
     def compute_class_loss(self, features, labels):
         similarity = self.classifier(self.image_mlp(features))
         mask = torch.cat([labels.eq(0).unsqueeze(1),labels.eq(1).unsqueeze(1)],dim=1)
-        mask = torch.min(torch.tensor(0.86).repeat(features.size(0)).cuda(), similarity.clone().detach()[mask]).bool()
-        # mask = torch.min(torch.tensor(0.7).repeat(features.size(0)).cuda(), similarity.clone().detach()[mask]).bool()
+        device = features.device
+        mask = torch.min(torch.tensor(0.86).repeat(features.size(0)).to(device), similarity.clone().detach()[mask]).bool()
+        # mask = torch.min(torch.tensor(0.7).repeat(features.size(0)).to(device), similarity.clone().detach()[mask]).bool()
         
         if (~mask).float().sum() > 0:
             class_loss = self.celoss(similarity[mask], labels[mask]) * labels[mask].size(0) - self.celoss(similarity[~mask], labels[~mask]) * labels[~mask].size(0) * 0.01
@@ -162,11 +164,12 @@ class resnet(nn.Module):
         features = self.model(images).squeeze()
         features = features / features.norm(dim=-1, keepdim=True)
         
-        variance_loss  = torch.max(torch.zeros(features.size(0)).cuda(), 0.04 - features.std(dim=1)).mean()
+        device = features.device
+        variance_loss  = torch.max(torch.zeros(features.size(0)).to(device), 0.04 - features.std(dim=1)).mean()
         class_loss     = self.compute_class_loss(features, labels)
         info_nce_loss  = 0.3 * self.compute_info_nce_loss(features, labels, domains)
         class_sim_loss = 0.3 * torch.matmul(self.classifier.weight[0], self.classifier.weight[1])
-        regular_loss   = self.l1loss(self.classifier.weight.norm(dim=1), 1*torch.ones(2).cuda())
+        regular_loss   = self.l1loss(self.classifier.weight.norm(dim=1), 1*torch.ones(2).to(device))
         total_loss     = class_loss + info_nce_loss + class_sim_loss + regular_loss
         
         self.loss_update(variance_loss, class_loss, info_nce_loss, class_sim_loss, regular_loss, total_loss)
@@ -188,7 +191,8 @@ class clip_encoder(nn.Module):
         self.gs = args.gs
 
         # load the model
-        self.model, _ = load("ViT-B/16", "cuda:0")
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        self.model, _ = load("ViT-B/16", device)
 
         # define the mlp
         in_dim, mlp_dim, out_dim = 512,4096,256
@@ -222,8 +226,9 @@ class clip_encoder(nn.Module):
         ]
 
         # tokenize the spoof and real templates
-        self.spoof_texts = tokenize(spoof_templates).cuda(non_blocking=True)  # tokenize
-        self.real_texts = tokenize(real_templates).cuda(non_blocking=True)  # tokenize
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.spoof_texts = tokenize(spoof_templates).to(device, non_blocking=True)  # tokenize
+        self.real_texts = tokenize(real_templates).to(device, non_blocking=True)  # tokenize
 
     def _build_mlp(self, in_dim, mlp_dim, out_dim):
         return nn.Sequential(
@@ -315,7 +320,7 @@ class clip_encoder(nn.Module):
                 except:
                     invariant_features = torch.inner(vectors, b).unsqueeze(1) * b
 
-            specific_features = vectors - invariant_features.detach().clone().cuda()
+            specific_features = vectors - invariant_features.detach().clone().to(vectors.device)
             return specific_features
 
     def compute_loss(self, images, labels, domains):
@@ -331,7 +336,8 @@ class clip_encoder(nn.Module):
 
         # stack the text features of liveness and spoofness.
         ensemble_weights = [spoof_class_embeddings, real_class_embeddings]
-        text_features = torch.stack(ensemble_weights, dim=0).cuda()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        text_features = torch.stack(ensemble_weights, dim=0).to(device)
 
         # get the image features and features
         image_features = self.model.encode_image(images)    # image-features
@@ -393,8 +399,9 @@ class clip_encoder(nn.Module):
         similarity = similarity[mask].view(size,-1)
         index      = index[mask].view(size,-1).bool()
 
-        similarity = torch.cat([similarity[index].view(size,-1),similarity[~index].view(size,-1)],dim=1) 
-        sim_label  = torch.zeros(size).long().cuda()
+        similarity = torch.cat([similarity[index].view(size,-1),similarity[~index].view(size,-1)],dim=1)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        sim_label  = torch.zeros(size).long().to(device)
 
         # II_similarity_loss = self.param2 * torch.nn.functional.cross_entropy(similarity, sim_label) 
         II_similarity_loss = self.params[2] * torch.nn.functional.cross_entropy(similarity, sim_label) 
@@ -424,7 +431,8 @@ class clip_encoder(nn.Module):
 
         # stack the embeddings for image-text similarity
         ensemble_weights = [spoof_class_embeddings, real_class_embeddings]
-        text_features = torch.stack(ensemble_weights, dim=0).cuda()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        text_features = torch.stack(ensemble_weights, dim=0).to(device)
 
         # get the image features
         image_features = self.model.encode_image(input)

@@ -1,6 +1,6 @@
-from data.facedataset import FaceDataset, BalanceFaceDataset
-from torchvision import transforms
+from .facedataset import BalanceFaceDataset, FaceDataset
 from torch.utils.data import DataLoader
+from torchvision import transforms
 
 
 def protocol_decoder(protocol):
@@ -20,6 +20,13 @@ def protocol_decoder(protocol):
         'R': '98k_real',
         'V': 'archive',
         'U': 'unidata_real',
+        # Custom datasets
+        'S': 'CelebA_Spoof-mini',
+        'F': 'FAS_processed',
+
+        # --- ADD THIS LINE ---
+        'Custom': 'CustomFAS',
+        # ---------------------
     }
 
     train_protocols, test_protocols = protocol.split('_to_')
@@ -72,7 +79,7 @@ def build_datasets(args):
                                        args.max_iter * args.batch_size, not args.silence)
     test_dataset = FaceDataset(args.data_root, test_protocol_names, 'test', test_transform, not args.silence)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     return train_loader, test_loader

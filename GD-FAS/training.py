@@ -24,19 +24,19 @@ def log_f(f, console=True):
 def parse_args():
     parser = argparse.ArgumentParser()
     # build dirs
-    parser.add_argument('--backbone', type=str, default="clip", help='backborn - resnet18 or clip')
+    parser.add_argument('--backbone', type=str, default="clip", help='backbone - resnet18 or clip')
     parser.add_argument('--silence', action='store_true')
     parser.add_argument('--log_name', type=str, default="test", help='log')
     parser.add_argument('--seed', type=int, default=2025, help='')
-    parser.add_argument('--data_root', type=str, default="datasets", help='YOUR_Data_Dir')
-    parser.add_argument('--protocol', type=str, default="O_C_I_to_M",
-                        help='O_C_I_to_M, O_M_I_to_C, O_C_M_to_I, I_C_M_to_O')
-    parser.add_argument('--max_iter', type=int, default=400, help='')
-    parser.add_argument('--batch_size', type=int, default=16, help='')
+    parser.add_argument('--data_root', type=str, default="dataset", help='YOUR_Data_Dir')
+    parser.add_argument('--protocol', type=str, default="Custom_to_Custom",
+                        help='S_to_S for CelebA_Spoof-mini, or Custom_to_Custom')
+    parser.add_argument('--max_iter', type=int, default=500, help='')
+    parser.add_argument('--batch_size', type=int, default=8, help='')
     parser.add_argument('--lr', type=float, default=0.000003, help='')
     parser.add_argument('--wd', type=float, default=0.000001, help='')
     parser.add_argument('--gs', action='store_true')
-    parser.add_argument('--save', action='store_true')
+    parser.add_argument('--save', type=bool, default=True)
     parser.add_argument('--beta', type=float, default=1.5, help='')
     parser.add_argument('--temperature', type=float, default=0.1, help='')
     parser.add_argument('--params', nargs=4, type=float, default=[1.0, 0.8, 0.1, 1.0])
@@ -66,7 +66,9 @@ def main(args):
     networks = build_model(args)
     optimizer = build_optimizer(args, networks)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=0.1)
-    networks.cuda()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    networks.to(device)
+    print(f'Using device: {device}')
 
     # training
     if not args.silence:
@@ -95,6 +97,7 @@ def main(args):
 
     best_select = [1, ""]
     for iter, batch_samples in enumerate(train_loader):
+        print(f"Processing batch {iter}...")
         epoch = iter // 10
         networks.train()
         optimizer.zero_grad()
@@ -102,9 +105,10 @@ def main(args):
         image_x_v1 = torch.cat([batch_samples[key]['image_x_v1'] for key in batch_samples])
         image_x_v2 = torch.cat([batch_samples[key]['image_x_v2'] for key in batch_samples])
 
-        images = torch.cat([image_x_v1, image_x_v2]).cuda()
-        labels = torch.cat([batch_samples[key]['label'] for key in batch_samples]).repeat(2).cuda()
-        domains = torch.cat([batch_samples[key]['domain'] for key in batch_samples]).repeat(2).cuda()
+        device = next(networks.parameters()).device
+        images = torch.cat([image_x_v1, image_x_v2]).to(device)
+        labels = torch.cat([batch_samples[key]['label'] for key in batch_samples]).repeat(2).to(device)
+        domains = torch.cat([batch_samples[key]['domain'] for key in batch_samples]).repeat(2).to(device)
 
         loss = networks.compute_loss(images, labels, domains)
         # break
@@ -122,8 +126,9 @@ def main(args):
             with torch.no_grad():
                 list_scores = []
                 for test_batch_samples in test_loader:
-                    images = test_batch_samples['image_x'].cuda()
-                    labels = test_batch_samples['label'].cuda()
+                    device = next(networks.parameters()).device
+                    images = test_batch_samples['image_x'].to(device)
+                    labels = test_batch_samples['label'].to(device)
                     logits, _ = networks(images)
                     # probs1 = torch.nn.functional.softmax(similarity, dim=1)
                     probs = torch.nn.functional.softmax(logits, dim=1)

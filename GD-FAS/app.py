@@ -1,24 +1,25 @@
-import sys
 import os
+import sys
+
 import cv2
 import numpy as np
 import torch
 from PIL import Image
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QTextEdit, QFileDialog
-)
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel,
+                               QMainWindow, QPushButton, QTextEdit,
+                               QVBoxLayout, QWidget)
 from torchvision import transforms
 from ultralytics import YOLO
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-MODEL_PATH = "results/test/O_C_I_to_M_best.pth"  # Path to your trained .pth file
+MODEL_PATH = "results/CelebA_Spoof_clip/S_to_S_best.pth"  # Path to your trained .pth file
 YOLO_MODEL = "yolov8n-face.pt"  # YOLO face detection model (or yolov8n.pt)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Force CPU since CUDA is not properly configured
+DEVICE = "cpu"
 SKIP_FRAMES = 3  # Process every Nth frame for video/webcam
 FACE_PADDING = 0.3  # Padding ratio for face crop (30%)
 INPUT_SIZE = 224  # CLIP expects 224x224
@@ -34,18 +35,22 @@ class YoloFaceDetector:
         """
         Args:
             yolo_weights: Path to YOLO model weights
-            device: 'cuda' or 'cpu'
+            device: 'cuda' or 'cpu' (forced to 'cpu' to avoid CUDA errors)
         """
-        self.device = device
+        # Force CPU to avoid CUDA/NMS errors
+        self.device = "cpu"
         self.padding = FACE_PADDING
 
         try:
+            # Initialize YOLO with explicit CPU device
             self.yolo = YOLO(yolo_weights)
-            print(f"✓ YOLO loaded: {yolo_weights}")
-        except:
+            self.yolo.to('cpu')
+            print(f"✓ YOLO loaded: {yolo_weights} (CPU mode)")
+        except Exception as e:
             # Fallback to standard YOLOv8n
-            print(f"⚠ Could not load {yolo_weights}, using yolov8n.pt")
+            print(f"⚠ Could not load {yolo_weights}, using yolov8n.pt. Error: {e}")
             self.yolo = YOLO("yolov8n.pt")
+            self.yolo.to('cpu')
 
         # CLIP-style transforms (same as training)
         self.transform = transforms.Compose([
@@ -66,8 +71,8 @@ class YoloFaceDetector:
         Returns:
             cropped_face: numpy array of face region, or None if no face detected
         """
-        # Run YOLO detection
-        results = self.yolo(img_rgb, verbose=False)
+        # Run YOLO detection - force device to CPU to avoid CUDA errors
+        results = self.yolo(img_rgb, verbose=False, device='cpu')
 
         if len(results) == 0 or len(results[0].boxes) == 0:
             return None
@@ -264,9 +269,16 @@ class AntiSpoofApp(QMainWindow):
 
             # 2. Load GD-FAS Model
             print(f"Loading GD-FAS model from {MODEL_PATH}...")
-            self.model = torch.load(MODEL_PATH, map_location=DEVICE)
+            # Force load to CPU and move all parameters to CPU
+            self.model = torch.load(MODEL_PATH, map_location='cpu')
+            self.model.to('cpu')  # Ensure all parameters are on CPU
             self.model.eval()
-            print(f"✓ Model loaded successfully")
+            
+            # Additional safety: ensure CLIP model inside is also on CPU
+            if hasattr(self.model, 'model'):
+                self.model.model.to('cpu')
+            
+            print(f"✓ Model loaded successfully (CPU mode)")
 
             # Update UI
             self.lbl_status.setText(f"Status: Ready ({DEVICE.upper()})")

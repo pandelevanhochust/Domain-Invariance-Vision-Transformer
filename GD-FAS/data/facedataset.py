@@ -1,6 +1,7 @@
-import numpy as np
-import os, random
+import os
+import random
 
+import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -18,8 +19,12 @@ class FaceDataset(Dataset):
         for num, data_name in enumerate(data_names):
             self.data_names[data_name] = num
 
+            # Support both 'attack' and 'spoof' folder names
             path_attack = os.path.join(root_dir, data_name, phase, 'attack')
-            path_live = path_attack.replace('attack', 'live')
+            if not os.path.exists(path_attack):
+                path_attack = os.path.join(root_dir, data_name, phase, 'spoof')
+            
+            path_live = os.path.join(root_dir, data_name, phase, 'live')
 
             video_attack_list = [os.path.join(path_attack, video) for video in os.listdir(path_attack)]
             video_live_list = [os.path.join(path_live, video) for video in os.listdir(path_live)]
@@ -38,7 +43,9 @@ class FaceDataset(Dataset):
     def __getitem__(self, idx):
         video_name = self.video_list[idx]
         spoofing_label = int('live' in video_name)
-        domain_label = self.data_names[video_name.split('/')[1]]
+        # Handle both Unix and Windows path separators
+        path_parts = video_name.replace('\\', '/').split('/')
+        domain_label = self.data_names[path_parts[1] if len(path_parts) > 1 else path_parts[0]]
         image_x = self.sample_image(video_name)
         image_x = self.transform(image_x)
 
@@ -72,15 +79,19 @@ class BalanceFaceDataset(Dataset):
         for num, data_name in enumerate(data_names):
             self.data_names[data_name] = num
 
-            path = os.path.join(root_dir, data_name, phase, 'attack')
-            video_list = [os.path.join(path, video) for video in os.listdir(path)]
+            # Support both 'attack' and 'spoof' folder names
+            path_attack = os.path.join(root_dir, data_name, phase, 'attack')
+            if not os.path.exists(path_attack):
+                path_attack = os.path.join(root_dir, data_name, phase, 'spoof')
+            
+            video_list = [os.path.join(path_attack, video) for video in os.listdir(path_attack)]
             random.shuffle(video_list)
-            self.video_list[path] = video_list
+            self.video_list[path_attack] = video_list
 
-            path = path.replace('attack', 'live')
-            video_list = [os.path.join(path, video) for video in os.listdir(path)]
+            path_live = os.path.join(root_dir, data_name, phase, 'live')
+            video_list = [os.path.join(path_live, video) for video in os.listdir(path_live)]
             random.shuffle(video_list)
-            self.video_list[path] = video_list
+            self.video_list[path_live] = video_list
 
         if verbose:
             print('--------------------------------------------------')
@@ -104,13 +115,26 @@ class BalanceFaceDataset(Dataset):
                 video_name = next(self.video_list[video_key])
 
             spoofing_label = int('live' in video_name)
-            domain_label = self.data_names[video_name.split('/')[1]]
+            # Handle both Unix and Windows path separators
+            path_parts = video_name.replace('\\', '/').split('/')
+            # domain_label = self.data_names[path_parts[1] if len(path_parts) > 1 else path_parts[0]]
+
+            domain_label = -1
+            for part in path_parts:
+                if part in self.data_names:
+                    domain_label = self.data_names[part]
+                    break
+
+            if domain_label == -1:
+                domain_label = list(self.data_names.values())[0]
 
             image_x = self.sample_image(video_name)
             image_x_view1 = self.transform(image_x)
             image_x_view2 = self.transform(image_x)
 
-            key = f"{video_key.split('/')[-3]}-{video_key.split('/')[-1]}"
+            # Handle both Unix and Windows path separators for key
+            key_parts = video_key.replace('\\', '/').split('/')
+            key = f"{key_parts[-3]}-{key_parts[-1]}"
             sample[key] = {
                 "image_x_v1": image_x_view1,
                 "image_x_v2": image_x_view2,
@@ -128,4 +152,4 @@ class BalanceFaceDataset(Dataset):
         image_id = np.random.randint(0, frames_total)
         image_path = os.path.join(image_dir, frames[image_id])
 
-        return Image.open(image_path)
+        return Image.open(image_path)      

@@ -2,16 +2,16 @@ from torch import nn
 from torch.utils.data import DataLoader, random_split
 import torch.optim as optim
 
-from FAS.core.data import full_dataset
-from FAS.core.DiVT import model
+import full_dataset
+import model
 
 # Split Data
 train_size = int(0.8 * len(full_dataset))
 val_size = len(full_dataset) - train_size
 train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
-val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0)
+val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
 
 # Optimizer & Loss
 optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)

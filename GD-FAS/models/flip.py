@@ -1,59 +1,48 @@
 import torch.nn as nn
+import clip, torch
 import torch.nn.functional as F
-import torchvision, torch
 import numpy as np
-
-from models.clip.clip import load, tokenize
 from collections import OrderedDict
-from scipy import optimize
-from utils import centroid_calculate_function
+
+spoof_templates = [
+    "This is an example of a spoof face",
+    "This is an example of an attack face",
+    "This is not a real face",
+    "This is how a spoof face looks like",
+    "a photo of a spoof face",
+    "a printout shown to be a spoof face",
+]
+
+real_templates = [
+    "This is an example of a real face",
+    "This is a bonafide face",
+    "This is a real face",
+    "This is how a real face looks like",
+    "a photo of a real face",
+    "This is not a spoof face",
+]
 
 
-class AverageMeter(object):
-    def __init__(self):
-        self.reset()
+class flip_mcl(nn.Module):
+    def __init__(self, in_dim, ssl_mlp_dim, ssl_emb_dim):
+        super(flip_mcl, self).__init__()
+        # load the model
+        self.model, _ = clip.load("ViT-B/16", "cuda:0")
 
-    def reset(self):
-        self.avg = 0
-        self.sum = 0
-        self.cnt = 0
+        # define the SSL parameters
+        self.image_mlp = self._build_mlp(
+            in_dim=in_dim, mlp_dim=ssl_mlp_dim, out_dim=ssl_emb_dim
+        )
+        self.n_views = 2
+        self.temperature = 0.1
 
-    def update(self, val, n=1):
-        if n > 0:
-            self.sum += val * n
-            self.cnt += n
-            self.avg = self.sum / self.cnt
+        # dot product similarity
+        self.cosine_similarity = nn.CosineSimilarity()
+        # mse loss
+        self.mse_loss = nn.MSELoss()
 
-
-class resnet(nn.Module):
-    # setup
-    def __init__(self, args):
-        super(resnet, self).__init__()
-        self.backbone = args.backbone
-        self.verbose = not args.silence
-
-        self.batch_size = args.batch_size
-        self.num_domain = args.num_domain
-        self.num_class = 2
-        self.build()
-
-    # build the network and loss
-    def build(self):
-        # encoder
-        model = getattr(torchvision.models, f'{self.backbone}')(
-            weights=f'ResNet{self.backbone.split("resnet")[1]}_Weights.DEFAULT')
-        module_sequence = []
-        for name, module in model.named_modules():
-            if name != '' and '.' not in name:
-                if 'fc' in name:
-                    self.last_dim = module.weight.size(1)
-                    break
-                module_sequence.append((name, module))
-
-        self.model = nn.Sequential(OrderedDict(module_sequence))
-
-        in_dim, mlp_dim, out_dim = self.last_dim, 4096, 256
-        self.image_mlp = nn.Sequential(
+    def _build_mlp(self, in_dim, mlp_dim, out_dim):
+        return nn.Sequential(
             OrderedDict(
                 [
                     ("layer1", nn.Linear(in_dim, mlp_dim)),
@@ -64,171 +53,264 @@ class resnet(nn.Module):
                     ("relu2", nn.ReLU(inplace=True)),
                     ("layer3", nn.Linear(mlp_dim, out_dim)),
                 ]
-            ))
-
-        # classifiers
-        self.classifier = nn.Linear(256, self.num_class, bias=False)
-
-        # criterion
-        self.celoss = nn.CrossEntropyLoss()
-
-        # loss_info
-        self.variance_loss = AverageMeter()
-        self.class_loss = AverageMeter()
-        self.info_nce_loss = AverageMeter()
-        self.class_sim_loss = AverageMeter()
-        self.regular_loss = AverageMeter()
-        self.total_loss = AverageMeter()
-
-        # inform backbone and number of parameters
-        if self.verbose:
-            encoder_param = sum(p.numel() for p in self.model.parameters())
-            classifier_param = sum(p.numel() for p in self.classifier.parameters())
-            total_param = encoder_param + classifier_param
-
-            print('------------------------------------------------------')
-            print(f'build_backbone   \t- {self.backbone}')
-            print('------------------------------------------------------')
-            print(f'total_param      \t: {total_param}')
-            print(f'encoder_param    \t: {encoder_param}')
-            print(f'classifier       \t: {classifier_param}')
-
-    def loss_update(self, variance_loss, class_loss, info_nce_loss, class_sim_loss, regular_loss, total_loss):
-        self.variance_loss.update(variance_loss.item())
-        self.class_loss.update(class_loss.item())
-        self.info_nce_loss.update(info_nce_loss.item())
-        self.class_sim_loss.update(class_sim_loss.item())
-        self.regular_loss.update(regular_loss.item())
-        self.total_loss.update(total_loss.item())
-
-    def loss_reset(self):
-        variance_loss = self.variance_loss.avg
-        class_loss = self.class_loss.avg
-        info_nce_loss = self.info_nce_loss.avg
-        class_sim_loss = self.class_sim_loss.avg
-        regular_loss = self.regular_loss.avg
-        total_loss = self.total_loss.avg
-
-        self.variance_loss.reset()
-        self.class_loss.reset()
-        self.info_nce_loss.reset()
-        self.total_loss.reset()
-
-        return {
-            'variance_loss': variance_loss,
-            'class_loss': class_loss,
-            'info_nce_loss': info_nce_loss,
-            'class_sim_loss': class_sim_loss,
-            'regular_loss': regular_loss,
-            'total_loss': total_loss,
-        }
-
-    def compute_class_loss(self, features, labels):
-        similarity = self.classifier(self.image_mlp(features))
-        mask = torch.cat([labels.eq(0).unsqueeze(1), labels.eq(1).unsqueeze(1)], dim=1)
-        mask = torch.min(torch.tensor(0.86).repeat(features.size(0)).cuda(), similarity.clone().detach()[mask]).bool()
-        # mask = torch.min(torch.tensor(0.7).repeat(features.size(0)).cuda(), similarity.clone().detach()[mask]).bool()
-
-        if (~mask).float().sum() > 0:
-            class_loss = self.celoss(similarity[mask], labels[mask]) * labels[mask].size(0) - self.celoss(
-                similarity[~mask], labels[~mask]) * labels[~mask].size(0) * 0.01
-            class_loss = class_loss / labels.size(0)
-            return class_loss
-
-        else:
-            class_loss = self.celoss(similarity[mask], labels[mask])
-            return class_loss
-
-    # close to same video image with different augmentation methods
-    def compute_info_nce_loss(self, features, labels, domains):
-        class_feature = self.classifier.weight.clone().detach()
-        class_feature = 0.86 * torch.cat([class_feature[a].unsqueeze(0) for a in labels], dim=0)
-        # class_feature = 0.7 * torch.cat([class_feature[a].unsqueeze(0) for a in labels],dim=0)
-
-        features = features - class_feature
-        features = features / features.norm(dim=-1, keepdim=True)
-        similarity_matrix = torch.matmul(features, features.T)
-
-        index = (domains.unsqueeze(0) == domains.unsqueeze(1))
-        mask = ~torch.eye(labels.size(0)).bool()
-
-        similarity_matrix = similarity_matrix[mask].view(domains.size(0), -1) / 0.1
-        index = index[mask].view(domains.size(0), -1).bool()
-
-        positive_features = similarity_matrix[index].view(48, -1).sum(dim=1)
-        negative_features = similarity_matrix[~index].view(48, -1).sum(dim=1)
-
-        info_nce_loss = (positive_features / (positive_features + negative_features)).mean()
-        return info_nce_loss
-
-    def compute_loss(self, images, labels, domains):
-        # concatenate features
-        features = self.model(images).squeeze()
-        features = features / features.norm(dim=-1, keepdim=True)
-
-        variance_loss = torch.max(torch.zeros(features.size(0)).cuda(), 0.04 - features.std(dim=1)).mean()
-        class_loss = self.compute_class_loss(features, labels)
-        info_nce_loss = 0.3 * self.compute_info_nce_loss(features, labels, domains)
-        class_sim_loss = 0.3 * torch.matmul(self.classifier.weight[0], self.classifier.weight[1])
-        regular_loss = self.l1loss(self.classifier.weight.norm(dim=1), 1 * torch.ones(2).cuda())
-        total_loss = class_loss + info_nce_loss + class_sim_loss + regular_loss
-
-        self.loss_update(variance_loss, class_loss, info_nce_loss, class_sim_loss, regular_loss, total_loss)
-
-        return total_loss
-
-    def forward(self, input):
-        features = F.normalize(self.model(input).squeeze())
-        return self.classifier(features) + 0.5
-
-
-class clip_encoder(nn.Module):
-    def __init__(self, args):
-        super(clip_encoder, self).__init__()
-        # args
-        self.params = args.params
-        self.temperature = args.temperature
-        self.alpha = np.log(args.num_domain) / 2
-        self.beta = args.beta
-        self.gs = args.gs
-
-        # load the model
-        self.model, _ = load("ViT-B/16", "cuda:0")
-
-        # define the mlp
-        in_dim, mlp_dim, out_dim = 512, 4096, 256
-        self.image_mlp = self._build_mlp(
-            in_dim=in_dim, mlp_dim=mlp_dim, out_dim=out_dim
+            )
         )
 
-        # define classifier
-        self.classifier = nn.Linear(256, 2, bias=True)
+    def info_nce_loss(self, feature_view_1, feature_view_2):
+        assert feature_view_1.shape == feature_view_2.shape
+        features = torch.cat([feature_view_1, feature_view_2], dim=0)
 
-        # define loss
-        self.define_losses()
+        labels = torch.cat(
+            [torch.arange(feature_view_1.shape[0]) for i in range(self.n_views)], dim=0
+        )
+        labels = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
+        labels = labels.cuda()
 
-        # define spoof and real templates
-        spoof_templates = [
-            "This is an example of a spoof face",
-            "This is an example of an attack face",
-            "This is not a real face",
-            "This is how a spoof face looks like",
-            "a photo of a spoof face",
-            "a printout shown to be a spoof face",
-        ]
+        features = F.normalize(features, dim=1)
 
-        real_templates = [
-            "This is an example of a real face",
-            "This is a bonafide face",
-            "This is a real face",
-            "This is how a real face looks like",
-            "a photo of a real face",
-            "This is not a spoof face",
-        ]
+        similarity_matrix = torch.matmul(features, features.T)
 
+        # discard the main diagonal from both: labels and similarities matrix
+        mask = torch.eye(labels.shape[0], dtype=torch.bool).cuda()
+        labels = labels[~mask].view(labels.shape[0], -1)
+        similarity_matrix = similarity_matrix[~mask].view(
+            similarity_matrix.shape[0], -1
+        )
+
+        # select and combine multiple positives
+        positives = similarity_matrix[labels.bool()].view(labels.shape[0], -1)
+
+        # select only the negatives the negatives
+        negatives = similarity_matrix[~labels.bool()].view(
+            similarity_matrix.shape[0], -1
+        )
+
+        logits = torch.cat([positives, negatives], dim=1)
+        labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
+
+        logits = logits / self.temperature
+        return logits, labels
+
+    def forward(self, input, input_view_1, input_view_2, source_labels, norm_flag=True):
         # tokenize the spoof and real templates
-        self.spoof_texts = tokenize(spoof_templates).cuda(non_blocking=True)  # tokenize
-        self.real_texts = tokenize(real_templates).cuda(non_blocking=True)  # tokenize
+        spoof_texts = clip.tokenize(spoof_templates).cuda(non_blocking=True)  # tokenize
+        real_texts = clip.tokenize(real_templates).cuda(non_blocking=True)  # tokenize
+        # encode the spoof and real templates with the text encoder
+        all_spoof_class_embeddings = self.model.encode_text(spoof_texts)
+        all_real_class_embeddings = self.model.encode_text(real_texts)
+
+        # ------------------- Image-Text similarity branch -------------------
+        # Ensemble of text features
+        # embed with text encoder
+        spoof_class_embeddings = all_spoof_class_embeddings.mean(dim=0)
+        real_class_embeddings = all_real_class_embeddings.mean(dim=0)
+
+        # stack the embeddings for image-text similarity
+        ensemble_weights = [spoof_class_embeddings, real_class_embeddings]
+        text_features = torch.stack(ensemble_weights, dim=0).cuda()
+        # get the image features
+        image_features = self.model.encode_image(input)
+        # normalized features
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        # cosine similarity as logits
+        logit_scale = self.model.logit_scale.exp()
+        logits_per_image = logit_scale * image_features @ text_features.t()
+
+        similarity = logits_per_image
+        # ------------------- Image-Text similarity branch -------------------
+
+        # ------------------------------ Image SSL branch -------------------------------- #
+        # Get the image embeddings for the ssl views
+        aug1 = self.model.encode_image(input_view_1)  # Bx512
+        aug2 = self.model.encode_image(input_view_2)  # Bx512
+
+        # Project the image embeddings to the SSL embedding space
+        aug1_embed = self.image_mlp(aug1)  # Bx256
+        aug2_embed = self.image_mlp(aug2)  # Bx256
+
+        # Get the logits for the SSL loss
+        logits_ssl, labels_ssl = self.info_nce_loss(aug1_embed, aug2_embed)
+        # ------------------------------ Image SSL branch --------------------------------
+
+        # ------------------------------ Image-Text dot product branch --------------------------------
+        # Split the prompts into 2 views
+        text_embedding_v1 = []
+        text_embedding_v2 = []
+        for label in source_labels:
+            label = int(label.item())
+
+            if label == 0:  # spoof
+                # Randomly choose indices for the 2 views
+                available_indices = np.arange(0, len(spoof_templates))
+                pair_1 = np.random.choice(available_indices, len(spoof_templates) // 2)
+                pair_2 = np.setdiff1d(available_indices, pair_1)
+                # slice embedding based on the indices
+                spoof_texts_v1 = [
+                    all_spoof_class_embeddings[i] for i in pair_1
+                ]  # slice from the embedded fake templates
+                spoof_texts_v2 = [
+                    all_spoof_class_embeddings[i] for i in pair_2
+                ]  # slice from the embedded fake templates
+                # stack the embeddings
+                spoof_texts_v1 = torch.stack(spoof_texts_v1, dim=0).cuda()  # 3x512
+                spoof_texts_v2 = torch.stack(spoof_texts_v2, dim=0).cuda()  # 3x512
+                assert (
+                    int(spoof_texts_v1.shape[1]) == 512
+                    and int(spoof_texts_v2.shape[1]) == 512
+                ), "text embedding shape is not 512"
+                # append the embeddings
+                text_embedding_v1.append(spoof_texts_v1.mean(dim=0))
+                text_embedding_v2.append(spoof_texts_v2.mean(dim=0))
+
+            elif label == 1:  # real
+                # Randomly choose indices for the 2 views
+                available_indices = np.arange(0, len(real_templates))
+                pair_1 = np.random.choice(available_indices, len(real_templates) // 2)
+                pair_2 = np.setdiff1d(available_indices, pair_1)
+                # slice embedding based on the indices
+                real_texts_v1 = [
+                    all_real_class_embeddings[i] for i in pair_1
+                ]  # slice from the tokenized templates
+                real_texts_v2 = [
+                    all_real_class_embeddings[i] for i in pair_2
+                ]  # slice from the tokenized templates
+                # stack the embeddings
+                real_texts_v1 = torch.stack(real_texts_v1, dim=0).cuda()  # 3x512
+                real_texts_v2 = torch.stack(real_texts_v2, dim=0).cuda()  # 3x512
+                assert (
+                    int(real_texts_v1.shape[1]) == 512
+                    and int(real_texts_v2.shape[1]) == 512
+                ), "text embedding shape is not 512"
+                # append the embeddings
+                text_embedding_v1.append(real_texts_v1.mean(dim=0))
+                text_embedding_v2.append(real_texts_v2.mean(dim=0))
+
+        text_embed_v1 = torch.stack(text_embedding_v1, dim=0).cuda()  # Bx512
+        text_embed_v2 = torch.stack(text_embedding_v2, dim=0).cuda()  # Bx512
+        assert (
+            int(text_embed_v1.shape[1]) == 512 and int(text_embed_v2.shape[1]) == 512
+        ), "text embedding shape is not 512"
+
+        # dot product of image and text embeddings
+        aug1_norm = aug1 / aug1.norm(dim=-1, keepdim=True)
+        aug2_norm = aug2 / aug2.norm(dim=-1, keepdim=True)
+
+        text_embed_v1_norm = text_embed_v1 / text_embed_v1.norm(dim=-1, keepdim=True)
+        text_embed_v2_norm = text_embed_v2 / text_embed_v2.norm(dim=-1, keepdim=True)
+
+        aug1_text_dot_product = self.cosine_similarity(aug1_norm, text_embed_v1_norm)
+        aug2_text_dot_product = self.cosine_similarity(aug2_norm, text_embed_v2_norm)
+
+        # mse loss between the dot product of aug1 and aug2
+        dot_product_loss = self.mse_loss(aug1_text_dot_product, aug2_text_dot_product)
+        # ------------------------------ Image-Text dot product branch --------------------------------
+
+        return similarity, logits_ssl, labels_ssl, dot_product_loss
+
+    def forward_eval(self, input, norm_flag=True):
+        # single text prompt per class
+        # logits_per_image, logits_per_text = self.model(input, self.text_inputs)
+
+        # Ensemble of text features
+        ensemble_weights = []
+        for classname in ["spoof", "real"]:
+            if classname == "spoof":
+                texts = spoof_templates  # format with spoof class
+            elif classname == "real":
+                texts = real_templates  # format with real class
+
+            texts = clip.tokenize(texts).cuda()  # tokenize
+            class_embeddings = self.model.encode_text(texts)  # embed with text encoder
+            class_embedding = class_embeddings.mean(dim=0)
+            ensemble_weights.append(class_embedding)
+        text_features = torch.stack(ensemble_weights, dim=0).cuda()
+
+        # get the image features
+        image_features = self.model.encode_image(input)
+        # normalized features
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        # cosine similarity as logits
+        logit_scale = self.model.logit_scale.exp()
+        logits_per_image = logit_scale * image_features @ text_features.t()
+
+        similarity = logits_per_image
+        return similarity, None
+
+    def forward_vis(self, input, norm_flag=True):
+        # image_features, image_features_proj = self.model.encode_image(input)
+        # _, image_features_proj = self.model.visual.forward_full(input)
+        image_features, image_features_proj = self.model.visual.forward_full(input)
+        feature = image_features_proj
+
+        # return None, feature
+        return image_features, feature
+
+class flip_our(nn.Module):
+    def __init__(self, in_dim, ssl_mlp_dim, ssl_emb_dim):
+        super(flip_our, self).__init__()
+        # load the model
+        self.model, _ = clip.load("ViT-B/16", "cuda:0")
+
+        # define the SSL parameters
+        self.image_mlp = self._build_mlp(
+            in_dim=in_dim, mlp_dim=ssl_mlp_dim, out_dim=ssl_emb_dim
+        )
+        self.n_views = 2
+        self.temperature = 0.1
+
+        # dot product similarity
+        self.cosine_similarity = nn.CosineSimilarity()
+        # mse loss
+        self.mse_loss = nn.MSELoss()
+
+        self.y1o = nn.Linear(256,2)
+        nn.init.xavier_normal_(self.y1o.weight)#cuda
+        self.y2o = nn.Linear(256,2)
+        nn.init.xavier_normal_(self.y2o.weight)
+
+        self.centers = (torch.rand(2, 256).cuda() - 0.5) * 2
+
+    def compute_center_loss(self, features, centers, targets):
+        features = features.view(features.size(0), -1)
+        target_centers = centers[targets]
+        center_loss = self.mse_loss(features, target_centers)
+        return center_loss
+
+    def update_center(self, features, targets):
+        # implementation equation (4) in the center-loss paper
+        features = features.view(features.size(0), -1)
+        targets, indices = torch.sort(targets)
+        target_centers = self.centers[targets]
+        features = features[indices]
+
+        delta_centers = target_centers - features
+        uni_targets, indices = torch.unique(
+                targets.cpu(), sorted=True, return_inverse=True)
+
+        uni_targets = uni_targets.cuda()
+        indices = indices.cuda()
+
+        delta_centers = torch.zeros(
+            uni_targets.size(0), delta_centers.size(1)
+        ).cuda().index_add_(0, indices, delta_centers)
+
+        targets_repeat_num = uni_targets.size()[0]
+        uni_targets_repeat_num = targets.size()[0]
+        targets_repeat = targets.repeat(
+                targets_repeat_num).view(targets_repeat_num, -1)
+        uni_targets_repeat = uni_targets.unsqueeze(1).repeat(
+                1, uni_targets_repeat_num)
+        same_class_feature_count = torch.sum(
+                targets_repeat == uni_targets_repeat, dim=1).float().unsqueeze(1)
+
+        delta_centers = delta_centers / (same_class_feature_count + 1.0) * 0.5
+        result = torch.zeros_like(self.centers)
+        result[uni_targets, :] = delta_centers
+        self.centers = self.centers - result
 
     def _build_mlp(self, in_dim, mlp_dim, out_dim):
         return nn.Sequential(
@@ -247,181 +329,13 @@ class clip_encoder(nn.Module):
             )
         )
 
-    def define_losses(self):
-        self.IT_similarity_loss = AverageMeter()
-        self.II_similarity_loss = AverageMeter()
-        self.class_loss = AverageMeter()
-        self.domain_loss = AverageMeter()
-        self.total_loss = AverageMeter()
-
-        self.sim_features = {
-            'sl': AverageMeter(),
-            'cl': AverageMeter()
-        }
-
-    def loss_reset(self):
-        IT_similarity_loss = self.IT_similarity_loss.avg
-        II_similarity_loss = self.II_similarity_loss.avg
-        class_loss = self.class_loss.avg
-        domain_loss = self.domain_loss.avg
-        total_loss = self.total_loss.avg
-        sim_features_sl = self.sim_features['sl'].avg
-        sim_features_cl = self.sim_features['cl'].avg
-
-        self.IT_similarity_loss.reset()
-        self.II_similarity_loss.reset()
-        self.class_loss.reset()
-        self.domain_loss.reset()
-        self.total_loss.reset()
-        self.sim_features['sl'].reset()
-        self.sim_features['cl'].reset()
-        info = {
-            'loss': 'IT {:.4f} II {:.4f} class {:.4f} domain {:.4f} total {:.4f} | sl : {:.4f} cl : {:.4f}'.format(
-                IT_similarity_loss, II_similarity_loss, class_loss, domain_loss, total_loss, sim_features_sl,
-                sim_features_cl),
-        }
-
-        return info
-
-    def compute_domain_similarity(self, text_features):
-        self.sim_features['sl'].update((text_features[0] @ text_features[1].t()).item())
-        self.sim_features['cl'].update((self.classifier.weight[0] @ self.classifier.weight[1].t()).item())
-
-    def scaling_estimator(self, input):
-        return self.beta / (1 + np.exp(-input / self.alpha)) - self.beta / 2 + 1
-
-    def group_wise_scaling(self, logits, labels):
-        sizes = [l.size(0) for l in labels]
-        losses = [torch.nn.functional.cross_entropy(logit, label) * size / sum(sizes)
-                  for logit, label, size in zip(logits, labels, sizes)]
-        n_losses = np.array([loss.item() for loss in losses])
-        norm_losses = (n_losses - n_losses.mean()) / n_losses.std()
-        return [l * self.scaling_estimator(n) for l, n in zip(losses, norm_losses)], losses
-
-    def gram_schmidt_process(self, vectors, basis=None):
-        if basis == None:
-            orthogonal_vectors = []
-            for v in vectors:
-                # Copy the current vector
-                ortho_v = v.clone()
-
-                # Subtract the projection of v onto each of the orthogonal vectors
-                for u in orthogonal_vectors:
-                    proj = torch.dot(v, u) / torch.dot(u, u) * u
-                    ortho_v -= proj
-
-                # Add non-zero orthogonal vectors to the basis
-                if torch.norm(ortho_v) > 1e-6:
-                    ortho_v = ortho_v / ortho_v.norm()
-                    orthogonal_vectors.append(ortho_v)
-            return orthogonal_vectors
-        else:
-            for b in basis:
-                try:
-                    invariant_features += torch.inner(vectors, b).unsqueeze(1) * b
-                except:
-                    invariant_features = torch.inner(vectors, b).unsqueeze(1) * b
-
-            specific_features = vectors - invariant_features.detach().clone().cuda()
-            return specific_features
-
-    def compute_loss(self, images, labels, domains):
+    def forward(self, input, patch, source_labels, norm_flag=True):
+        # tokenize the spoof and real templates
+        spoof_texts = clip.tokenize(spoof_templates).cuda(non_blocking=True)  # tokenize
+        real_texts = clip.tokenize(real_templates).cuda(non_blocking=True)  # tokenize
         # encode the spoof and real templates with the text encoder
-        all_spoof_class_embeddings = self.model.encode_text(self.spoof_texts)
-        all_real_class_embeddings = self.model.encode_text(self.real_texts)
-
-        # ------------------- Image-Text Ebedding Space Branch -------------------
-        # Ensemble of text features
-        # embed with text encoder
-        spoof_class_embeddings = all_spoof_class_embeddings.mean(dim=0)
-        real_class_embeddings = all_real_class_embeddings.mean(dim=0)
-
-        # stack the text features of liveness and spoofness.
-        ensemble_weights = [spoof_class_embeddings, real_class_embeddings]
-        text_features = torch.stack(ensemble_weights, dim=0).cuda()
-
-        # get the image features and features
-        image_features = self.model.encode_image(images)  # image-features
-
-        # normalized features
-        norm_image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        norm_text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-
-        # cosine similarity as logits
-        logit_scale = self.model.logit_scale.exp()
-        logits_per_image = torch.inner(norm_image_features, norm_text_features) * logit_scale
-
-        group_label = labels + 2 * domains  # A1 0 L1 1 A2 2 L2 3 A3 4 L3 5
-        group_size = group_label.unique().size(0)
-
-        if self.gs:
-            IT_similarity_loss, _ = self.group_wise_scaling(
-                [logits_per_image[group_label.eq(group)] for group in range(group_size)],
-                [labels[group_label.eq(group)] for group in range(group_size)]
-            )
-        else:
-            IT_similarity_loss = [torch.nn.functional.cross_entropy(logits_per_image, labels)]
-
-        # IT_similarity_loss = self.params[0] * sum(IT_similarity_loss)
-        IT_similarity_loss = sum(IT_similarity_loss)
-
-        self.IT_similarity_loss.update(IT_similarity_loss.item())
-
-        self.compute_domain_similarity(norm_text_features)
-
-        # domain similarity
-        size = images.size(0)
-        mask = ~torch.eye(size).bool()
-
-        basis = self.gram_schmidt_process(text_features, None)
-        specific_features = self.gram_schmidt_process(image_features, basis)
-
-        domain_similarity = torch.inner(specific_features, specific_features) / self.temperature
-        domain_sim_mask = (domains.unsqueeze(0) == domains.unsqueeze(1)).float()
-
-        domain_similarity = domain_similarity[mask].view(size, -1)
-        domain_sim_mask = domain_sim_mask[mask].view(size, -1)
-        domain_loss = -torch.mean(torch.div(domain_sim_mask * torch.nn.functional.log_softmax(domain_similarity, dim=1),
-                                            domain_sim_mask.sum(dim=1).unsqueeze(1)))
-
-        domain_loss = self.params[1] * domain_loss
-        # domain_loss = self.param1 * domain_loss
-        self.domain_loss.update(domain_loss.item())
-
-        # ------------------- Image Embedding Space Branch -------------------
-        # cosine similarity as same image different view
-        embedding_features = self.image_mlp(image_features)  # features
-        logits = self.classifier(embedding_features)
-        norm_embedding_features = embedding_features / embedding_features.norm(dim=-1, keepdim=True)
-        similarity = torch.inner(norm_embedding_features, norm_embedding_features) / 0.8
-        index = torch.arange(int(size / 2)).repeat(2)
-        index = (index.unsqueeze(0) == index.unsqueeze(1))
-
-        similarity = similarity[mask].view(size, -1)
-        index = index[mask].view(size, -1).bool()
-
-        similarity = torch.cat([similarity[index].view(size, -1), similarity[~index].view(size, -1)], dim=1)
-        sim_label = torch.zeros(size).long().cuda()
-
-        # II_similarity_loss = self.param2 * torch.nn.functional.cross_entropy(similarity, sim_label)
-        II_similarity_loss = self.params[2] * torch.nn.functional.cross_entropy(similarity, sim_label)
-
-        self.II_similarity_loss.update(II_similarity_loss.item())
-
-        logits = self.classifier(embedding_features)
-
-        class_loss = torch.nn.functional.cross_entropy(logits, labels)
-
-        self.class_loss.update(class_loss.item())
-
-        total_loss = IT_similarity_loss + II_similarity_loss + domain_loss + class_loss
-        self.total_loss.update(total_loss.item())
-        return total_loss
-
-    def forward(self, input):
-        # encode the spoof and real templates with the text encoder
-        all_spoof_class_embeddings = self.model.encode_text(self.spoof_texts)
-        all_real_class_embeddings = self.model.encode_text(self.real_texts)
+        all_spoof_class_embeddings = self.model.encode_text(spoof_texts)
+        all_real_class_embeddings = self.model.encode_text(real_texts)
 
         # ------------------- Image-Text similarity branch -------------------
         # Ensemble of text features
@@ -435,14 +349,71 @@ class clip_encoder(nn.Module):
 
         # get the image features
         image_features = self.model.encode_image(input)
-        embedding_features = self.image_mlp(image_features)
+        face_em = self.image_mlp(image_features)
 
-        # # normalized features
-        norm_image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        norm_text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        # normalized features
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
 
         # cosine similarity as logits
         logit_scale = self.model.logit_scale.exp()
-        logits_per_image = norm_image_features @ norm_text_features.t() * logit_scale
+        logits_per_image = logit_scale * image_features @ text_features.t()
 
-        return logits_per_image, self.classifier(embedding_features)
+
+        similarity = logits_per_image
+        # ------------------- Image-Text similarity branch -------------------
+
+        # ------------------- Image_space ------------------------------------
+        patch_features = self.model.encode_image(patch)
+        patch_em = self.image_mlp(patch_features)
+
+        face_out = self.y1o(face_em)
+        patch_out = self.y2o(patch_em)
+
+        center_loss = self.compute_center_loss(patch_em, self.centers, source_labels)
+        # ------------------- Image_space ------------------------------------
+
+        return similarity, face_out, patch_out, center_loss, face_em
+
+    def forward_eval(self, input, norm_flag=True):
+        # single text prompt per class
+        # logits_per_image, logits_per_text = self.model(input, self.text_inputs)
+
+        # Ensemble of text features
+        ensemble_weights = []
+        for classname in ["spoof", "real"]:
+            if classname == "spoof":
+                texts = spoof_templates  # format with spoof class
+            elif classname == "real":
+                texts = real_templates  # format with real class
+
+            texts = clip.tokenize(texts).cuda()  # tokenize
+            class_embeddings = self.model.encode_text(texts)  # embed with text encoder
+            class_embedding = class_embeddings.mean(dim=0)
+            ensemble_weights.append(class_embedding)
+        text_features = torch.stack(ensemble_weights, dim=0).cuda()
+
+        # get the image features
+        image_features = self.model.encode_image(input)
+        image_em = self.image_mlp(image_features)
+        image_out = self.y1o(image_em)
+        # normalized features
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        # cosine similarity as logits
+        logit_scale = self.model.logit_scale.exp()
+        logits_per_image = logit_scale * image_features @ text_features.t()
+
+        similarity = logits_per_image
+        return similarity, image_out
+
+    def forward_vis(self, input, norm_flag=True):
+        # image_features, image_features_proj = self.model.encode_image(input)
+        # _, image_features_proj = self.model.visual.forward_full(input)
+        image_features, image_features_proj = self.model.visual.forward_full(input)
+        feature = image_features_proj
+
+        # return None, feature
+        return image_features, feature

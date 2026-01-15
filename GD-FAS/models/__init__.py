@@ -1,5 +1,5 @@
 import torch
-from models import networks
+from . import  networks
 
 def backbone_map(backbone):
     if 'resnet' in backbone:
