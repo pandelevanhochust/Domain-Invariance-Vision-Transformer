@@ -1,5 +1,6 @@
 import os
 import sys
+import requests
 
 # --- CRITICAL FIX: PREVENT DLL CONFLICTS ---
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -25,6 +26,25 @@ except ImportError:
         from models.networks import build_model
     except ImportError:
         build_model = None
+
+
+# --- HELPER: DOWNLOAD FACE MODEL ---
+def check_and_download_yolo_face():
+    """Checks for yolov8n-face.pt and downloads it if missing."""
+    filename = "yolov8n-face.pt"
+    if not os.path.exists(filename):
+        print(f"📥 Downloading {filename} (Face Detection Model)...")
+        url = "https://github.com/akanametov/yolo-face/releases/download/v0.0.0/yolov8n-face.pt"
+        try:
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
+            with open(filename, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print("✅ Download complete!")
+        except Exception as e:
+            print(f"❌ Failed to download model: {e}")
+    return filename
 
 
 # --- CONFIGURATION ---
@@ -65,13 +85,15 @@ class InferenceWorker(QThread):
         self.current_frame = None
         self.is_running = True
         self.yolo = None
+        # --- CHANGED: 40% Padding ---
+        self.padding_ratio = 1
 
     def run(self):
         if self.yolo is None:
-            print("Loading YOLOv8n on CPU (Safe Mode)...")
+            model_file = check_and_download_yolo_face()
+            print(f"Loading {model_file} on CPU...")
             try:
-                # Load YOLO
-                self.yolo = YOLO("yolov8n.pt")
+                self.yolo = YOLO(model_file)
             except Exception as e:
                 print(f"❌ YOLO Load Error: {e}")
                 return
@@ -81,14 +103,13 @@ class InferenceWorker(QThread):
                 try:
                     frame = self.current_frame.copy()
 
-                    # --- FIX: FORCE YOLO TO RUN ON CPU ---
-                    # This avoids the 'torchvision::nms' CUDA crash
-                    results = self.yolo(frame, verbose=False, classes=[0], device='cpu')
+                    # --- FACE DETECTION ---
+                    results = self.yolo(frame, verbose=False, device='cpu')
 
                     detected = False
                     label_text = "NO FACE"
                     conf_value = 0.0
-                    box_color = "#808080"  # Grey
+                    box_color = "#808080"
 
                     if len(results) > 0 and len(results[0].boxes) > 0:
                         boxes = results[0].boxes
@@ -96,7 +117,6 @@ class InferenceWorker(QThread):
                         best_box = None
 
                         for box in boxes:
-                            # Use .cpu() to ensure coordinates are safe to use
                             x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
                             area = (x2 - x1) * (y2 - y1)
                             if area > largest_area:
@@ -105,13 +125,26 @@ class InferenceWorker(QThread):
 
                         if best_box:
                             x1, y1, x2, y2 = best_box
-                            h, w, _ = frame.shape
-                            x1, y1 = max(0, x1), max(0, y1)
-                            x2, y2 = min(w, x2), min(h, y2)
+                            h_img, w_img, _ = frame.shape
 
-                            if x2 > x1 and y2 > y1:
+                            # --- CALCULATE PADDING ---
+                            box_w = x2 - x1
+                            box_h = y2 - y1
+
+                            pad_w = int(box_w * self.padding_ratio)
+                            pad_h = int(box_h * self.padding_ratio)
+
+                            # Apply padding (Clamp to ensure we don't go out of image)
+                            crop_x1 = max(0, x1 - pad_w)
+                            crop_y1 = max(0, y1 - pad_h)
+                            crop_x2 = min(w_img, x2 + pad_w)
+                            crop_y2 = min(h_img, y2 + pad_h)
+
+                            if crop_x2 > crop_x1 and crop_y2 > crop_y1:
                                 detected = True
-                                face_crop = frame[y1:y2, x1:x2]
+
+                                # Crop the PADDED face
+                                face_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
 
                                 # --- FAS MODEL INFERENCE ---
                                 rgb_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
@@ -128,26 +161,27 @@ class InferenceWorker(QThread):
                                     probs = torch.softmax(cls_score, dim=1)
                                     conf, preds = torch.max(probs, 1)
                                     conf_value = conf.item()
-
-                                    # --- BUG FIX 1: Define 'idx' ---
                                     idx = preds.item()
 
-                                    # --- BUG FIX 2: Define Colors correctly ---
                                     if idx == 0:
                                         label_text = "LIVE"
-                                        cv_color = (0, 255, 0)  # Green for OpenCV
-                                        box_color = "#d4edda"  # Hex for UI
+                                        cv_color = (0, 255, 0)
+                                        box_color = "#d4edda"
                                     elif idx == 1:
                                         label_text = "CUT-OUT"
-                                        cv_color = (255, 255, 0)  # Cyan/Yellow
+                                        cv_color = (0, 255, 255)
                                         box_color = "#fff3cd"
                                     elif idx == 2:
                                         label_text = "REPLAY"
-                                        cv_color = (0, 0, 255)  # Red
+                                        cv_color = (0, 0, 255)
                                         box_color = "#f8d7da"
 
-                                # Draw rectangle using the defined cv_color
+                                # Draw original detection box (tight)
                                 cv2.rectangle(frame, (x1, y1), (x2, y2), cv_color, 2)
+
+                                # Optional: Visualize the 40% padding area (dashed/thin)
+                                # cv2.rectangle(frame, (crop_x1, crop_y1), (crop_x2, crop_y2), (200, 200, 200), 1)
+
                                 cv2.putText(frame, f"{label_text}", (x1, y1 - 10),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, cv_color, 2)
 
@@ -171,7 +205,7 @@ class InferenceWorker(QThread):
 class FASWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FAS System (Hybrid CPU/GPU)")
+        self.setWindowTitle("FAS System (Face Specific + 40% Padding)")
         self.setGeometry(100, 100, 1000, 700)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -203,6 +237,7 @@ class FASWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Model build failed: {e}")
             return None
 
+        # POINT TO YOUR MODEL PATH
         model_path = "results/Run_Unified_MultiClass/Custom_to_Custom_best.pth"
         if os.path.exists(model_path):
             try:
@@ -271,13 +306,12 @@ class FASWindow(QMainWindow):
 
     def start_webcam(self):
         self.stop_stream()
-        # TRY INDEX 0 FIRST, IF FAILS, TRY 1 (External Camera)
         self.cap = cv2.VideoCapture(0)
         if not self.cap.isOpened():
             print("⚠️ Camera 0 failed. Trying Camera 1...")
             self.cap = cv2.VideoCapture(1)
             if not self.cap.isOpened():
-                QMessageBox.critical(self, "Error", "Could not open any webcam.\nCheck if Zoom/Teams is using it.")
+                QMessageBox.critical(self, "Error", "Could not open any webcam.")
                 return
         self.timer.start(30)
 
