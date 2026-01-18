@@ -15,3 +15,6 @@ python training.py --backbone clip --gs --temperature 0.1 --data_root dataset/Cr
 # python training.py --gs --temperature 0.1 --protocol O_M_I_to_C
 # python training.py --gs --temperature 1.1 --protocol O_C_M_to_I
 # python training.py --gs --temperature 1.0 --protocol I_C_M_to_O
+
+
+python training.py --backbone clip --gs --temperature 0.1  --num_classes 3  --protocol Custom_to_Custom  --data_root dataset/Unified_FAS --log_name Run_Unified_MultiClass

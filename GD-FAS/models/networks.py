@@ -201,34 +201,42 @@ class clip_encoder(nn.Module):
         )
 
         # define classifier
-        self.classifier  = nn.Linear(256, 2, bias=True)
+        self.classifier  = nn.Linear(256, 3, bias=True)
 
         # define loss
         self.define_losses()
 
         # define spoof and real templates
-        spoof_templates = [
-            "This is an example of a spoof face",
-            "This is an example of an attack face",
-            "This is not a real face",
-            "This is how a spoof face looks like",
-            "a photo of a spoof face",
-            "a printout shown to be a spoof face",
-        ]
-
-        real_templates = [
-            "This is an example of a real face",
-            "This is a bonafide face",
+        # Class 0: Live
+        live_templates = [
             "This is a real face",
-            "This is how a real face looks like",
-            "a photo of a real face",
-            "This is not a spoof face",
+            "This is a bonafide face",
+            "a photo of a live person",
+            "This is not a spoof",
         ]
 
-        # tokenize the spoof and real templates
+        # Class 1: Cutout
+        cutout_templates = [
+            "This is a cutout attack",
+            "a photo of a paper mask",
+            "a face with holes cut out",
+            "a printed paper held up to the camera",
+        ]
+
+        # Class 2: Replay
+        replay_templates = [
+            "This is a replay attack",
+            "a video played on a screen",
+            "a face shown on an ipad or phone",
+            "pixelated screen reflection",
+        ]
+
+        # Tokenize all 3
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.spoof_texts = tokenize(spoof_templates).to(device, non_blocking=True)  # tokenize
-        self.real_texts = tokenize(real_templates).to(device, non_blocking=True)  # tokenize
+        self.live_texts = tokenize(live_templates).to(device, non_blocking=True)
+        self.cutout_texts = tokenize(cutout_templates).to(device, non_blocking=True)
+        self.replay_texts = tokenize(replay_templates).to(device, non_blocking=True)
+
 
     def _build_mlp(self, in_dim, mlp_dim, out_dim):
         return nn.Sequential(
@@ -324,51 +332,55 @@ class clip_encoder(nn.Module):
             return specific_features
 
     def compute_loss(self, images, labels, domains):
-        # encode the spoof and real templates with the text encoder
-        all_spoof_class_embeddings = self.model.encode_text(self.spoof_texts)
-        all_real_class_embeddings = self.model.encode_text(self.real_texts)
+        # ------------------- 1. Encode Text for 3 Classes -------------------
+        # Encode the templates defined in __init__
+        all_live_embeddings = self.model.encode_text(self.live_texts)
+        all_cutout_embeddings = self.model.encode_text(self.cutout_texts)
+        all_replay_embeddings = self.model.encode_text(self.replay_texts)
 
-        # ------------------- Image-Text Ebedding Space Branch -------------------
-        # Ensemble of text features
-        # embed with text encoder
-        spoof_class_embeddings = all_spoof_class_embeddings.mean(dim=0)
-        real_class_embeddings = all_real_class_embeddings.mean(dim=0)
+        # Average features to get class prototypes
+        live_class_embeddings = all_live_embeddings.mean(dim=0)
+        cutout_class_embeddings = all_cutout_embeddings.mean(dim=0)
+        replay_class_embeddings = all_replay_embeddings.mean(dim=0)
 
-        # stack the text features of liveness and spoofness.
-        ensemble_weights = [spoof_class_embeddings, real_class_embeddings]
+        # Stack them in order: 0=Live, 1=Cutout, 2=Replay
+        ensemble_weights = [live_class_embeddings, cutout_class_embeddings, replay_class_embeddings]
         device = "cuda" if torch.cuda.is_available() else "cpu"
         text_features = torch.stack(ensemble_weights, dim=0).to(device)
 
-        # get the image features and features
-        image_features = self.model.encode_image(images)    # image-features
+        # ------------------- 2. Image Features & Logits -------------------
+        image_features = self.model.encode_image(images)  # (Batch_Size, 512)
 
-        # normalized features
+        # Normalized features for cosine similarity
         norm_image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         norm_text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        # cosine similarity as logits
+        # Calculate Logits (Batch_Size, 3)
         logit_scale = self.model.logit_scale.exp()
         logits_per_image = torch.inner(norm_image_features, norm_text_features) * logit_scale
 
-        group_label = labels + 2 * domains # A1 0 L1 1 A2 2 L2 3 A3 4 L3 5
+        # ------------------- 3. Image-Text Similarity Loss -------------------
+        # Update group labeling for 3 classes (0, 1, 2)
+        # Prevents collision between domains (e.g. Domain 0 Class 2 vs Domain 1 Class 0)
+        group_label = labels + 3 * domains
         group_size = group_label.unique().size(0)
 
         if self.gs:
+            # Gradient Scaling logic
             IT_similarity_loss, _ = self.group_wise_scaling(
                 [logits_per_image[group_label.eq(group)] for group in range(group_size)],
                 [labels[group_label.eq(group)] for group in range(group_size)]
-                )
+            )
         else:
+            # Standard Cross Entropy
             IT_similarity_loss = [torch.nn.functional.cross_entropy(logits_per_image, labels)]
 
-        # IT_similarity_loss = self.params[0] * sum(IT_similarity_loss)
         IT_similarity_loss = sum(IT_similarity_loss)
-
         self.IT_similarity_loss.update(IT_similarity_loss.item())
 
+        # ------------------- 4. Domain Loss -------------------
         self.compute_domain_similarity(norm_text_features)
 
-        # domain similarity
         size = images.size(0)
         mask = ~torch.eye(size).bool()
 
@@ -378,72 +390,80 @@ class clip_encoder(nn.Module):
         domain_similarity = torch.inner(specific_features, specific_features) / self.temperature
         domain_sim_mask = (domains.unsqueeze(0) == domains.unsqueeze(1)).float()
 
-        domain_similarity = domain_similarity[mask].view(size,-1)
-        domain_sim_mask = domain_sim_mask[mask].view(size,-1)
-        domain_loss = -torch.mean(torch.div(domain_sim_mask * torch.nn.functional.log_softmax(domain_similarity,dim=1),
-                                        domain_sim_mask.sum(dim=1).unsqueeze(1)))
-    
+        domain_similarity = domain_similarity[mask].view(size, -1)
+        domain_sim_mask = domain_sim_mask[mask].view(size, -1)
+
+        # Calculate loss with safety check for division by zero
+        div_term = domain_sim_mask.sum(dim=1).unsqueeze(1)
+        div_term[div_term == 0] = 1.0
+
+        domain_loss = -torch.mean(torch.div(domain_sim_mask * torch.nn.functional.log_softmax(domain_similarity, dim=1),
+                                            div_term))
+
         domain_loss = self.params[1] * domain_loss
-        # domain_loss = self.param1 * domain_loss
         self.domain_loss.update(domain_loss.item())
 
-        # ------------------- Image Embedding Space Branch -------------------
-        # cosine similarity as same image different view
-        embedding_features = self.image_mlp(image_features) # features
+        # ------------------- 5. Image Embedding Loss (Contrastive) -------------------
+        embedding_features = self.image_mlp(image_features)
         logits = self.classifier(embedding_features)
-        norm_embedding_features = embedding_features/embedding_features.norm(dim=-1,keepdim=True)
+
+        norm_embedding_features = embedding_features / embedding_features.norm(dim=-1, keepdim=True)
         similarity = torch.inner(norm_embedding_features, norm_embedding_features) / 0.8
-        index = torch.arange(int(size/2)).repeat(2)
+
+        # Assuming batch is constructed as pairs (original, augmented)
+        # This logic handles self-supervised consistency
+        index = torch.arange(int(size / 2)).repeat(2)
+        index = index.to(device)  # Ensure device match
         index = (index.unsqueeze(0) == index.unsqueeze(1))
 
-        similarity = similarity[mask].view(size,-1)
-        index      = index[mask].view(size,-1).bool()
+        similarity = similarity[mask].view(size, -1)
+        index = index[mask].view(size, -1).bool()
 
-        similarity = torch.cat([similarity[index].view(size,-1),similarity[~index].view(size,-1)],dim=1)
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        sim_label  = torch.zeros(size).long().to(device)
+        similarity = torch.cat([similarity[index].view(size, -1), similarity[~index].view(size, -1)], dim=1)
+        sim_label = torch.zeros(size).long().to(device)
 
-        # II_similarity_loss = self.param2 * torch.nn.functional.cross_entropy(similarity, sim_label) 
-        II_similarity_loss = self.params[2] * torch.nn.functional.cross_entropy(similarity, sim_label) 
-    
+        II_similarity_loss = self.params[2] * torch.nn.functional.cross_entropy(similarity, sim_label)
         self.II_similarity_loss.update(II_similarity_loss.item())
 
-        logits = self.classifier(embedding_features)
-
-        class_loss = torch.nn.functional.cross_entropy(logits,labels)
-        
+        # ------------------- 6. Classifier Loss -------------------
+        # Standard Cross Entropy on the 3-class MLP head
+        class_loss = torch.nn.functional.cross_entropy(logits, labels)
         self.class_loss.update(class_loss.item())
 
-        total_loss = IT_similarity_loss + II_similarity_loss + domain_loss + class_loss 
+        # Total Loss
+        total_loss = IT_similarity_loss + II_similarity_loss + domain_loss + class_loss
         self.total_loss.update(total_loss.item())
         return total_loss
 
     def forward(self, input):
-        # encode the spoof and real templates with the text encoder
-        all_spoof_class_embeddings = self.model.encode_text(self.spoof_texts)
-        all_real_class_embeddings = self.model.encode_text(self.real_texts)
+        # 1. Encode templates for all 3 classes
+        all_live_embeddings = self.model.encode_text(self.live_texts)
+        all_cutout_embeddings = self.model.encode_text(self.cutout_texts)
+        all_replay_embeddings = self.model.encode_text(self.replay_texts)
 
-        # ------------------- Image-Text similarity branch -------------------
-        # Ensemble of text features
-        # embed with text encoder
-        spoof_class_embeddings = all_spoof_class_embeddings.mean(dim=0)
-        real_class_embeddings = all_real_class_embeddings.mean(dim=0)
+        # 2. Compute Mean Embeddings
+        live_class_embeddings = all_live_embeddings.mean(dim=0)
+        cutout_class_embeddings = all_cutout_embeddings.mean(dim=0)
+        replay_class_embeddings = all_replay_embeddings.mean(dim=0)
 
-        # stack the embeddings for image-text similarity
-        ensemble_weights = [spoof_class_embeddings, real_class_embeddings]
+        # 3. Stack features (Order must match labels: 0, 1, 2)
+        ensemble_weights = [live_class_embeddings, cutout_class_embeddings, replay_class_embeddings]
         device = "cuda" if torch.cuda.is_available() else "cpu"
         text_features = torch.stack(ensemble_weights, dim=0).to(device)
 
-        # get the image features
+        # 4. Get Image Features
         image_features = self.model.encode_image(input)
         embedding_features = self.image_mlp(image_features)
 
-        # # normalized features
+        # 5. Normalize
         norm_image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         norm_text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        # cosine similarity as logits
+        # 6. Calculate Logits (Batch x 3)
         logit_scale = self.model.logit_scale.exp()
         logits_per_image = norm_image_features @ norm_text_features.t() * logit_scale
 
+        # Return:
+        # 1. Logits from CLIP (Image-Text similarity)
+        # 2. Logits from MLP Classifier
         return logits_per_image, self.classifier(embedding_features)

@@ -134,14 +134,15 @@ class InferenceWorker(QThread):
                                     conf, preds = torch.max(probs, 1)
                                     conf_value = conf.item()
 
-                                    if preds.item() == 1:
+                                    if idx == 0:
                                         label_text = "LIVE"
-                                        box_color = "#00FF00"
-                                        cv_color = (0, 255, 0)
-                                    else:
-                                        label_text = "ATTACK"
-                                        box_color = "#FF0000"
-                                        cv_color = (0, 0, 255)
+                                        color = (0, 255, 0)  # Green
+                                    elif idx == 1:
+                                        label_text = "CUT-OUT"
+                                        color = (0, 255, 255)  # Yellow/Cyan
+                                    elif idx == 2:
+                                        label_text = "REPLAY"
+                                        color = (0, 0, 255)  # Red
 
                                 cv2.rectangle(frame, (x1, y1), (x2, y2), cv_color, 2)
                                 cv2.putText(frame, f"{label_text}", (x1, y1 - 10),

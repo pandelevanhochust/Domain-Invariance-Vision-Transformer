@@ -41,6 +41,10 @@ def parse_args():
     parser.add_argument('--temperature', type=float, default=0.1, help='')
     parser.add_argument('--params', nargs=4, type=float, default=[1.0, 0.8, 0.1, 1.0])
     parser.add_argument('--step_size', type=int, default=10, help='')
+
+    # --- ADDED THIS LINE ---
+    parser.add_argument('--num_classes', type=int, default=2, help='2 for binary, 3 for multi-class')
+
     return parser.parse_args()
 
 
@@ -87,6 +91,7 @@ def main(args):
         print(f'{"gs":20} : {args.gs}')
         print(f'{"beta":20} : {args.beta}')
         print(f'{"temperature":20} : {args.temperature}')
+        print(f'{"num classes":20} : {args.num_classes}')  # Print new arg
         print(f'{"parameter1":20} : {args.params[0]}')
         print(f'{"parameter2":20} : {args.params[1]}')
         print(f'{"parameter3":20} : {args.params[2]}')
@@ -130,10 +135,21 @@ def main(args):
                     images = test_batch_samples['image_x'].to(device)
                     labels = test_batch_samples['label'].to(device)
                     logits, _ = networks(images)
-                    # probs1 = torch.nn.functional.softmax(similarity, dim=1)
+
                     probs = torch.nn.functional.softmax(logits, dim=1)
+
                     for prob, label in zip(probs, labels):
-                        list_scores.append("{} {}\n".format(prob[1].item(), label.item()))
+                        # --- CRITICAL FIX FOR MULTI-CLASS EVALUATION ---
+                        # In Binary: prob[1] is attack score.
+                        # In Multi-class: prob[0]=Live, prob[1]=Cutout, prob[2]=Replay
+                        # Spoof Score = 1.0 - Prob(Live)
+                        # This works for both Binary and Multi-class!
+                        spoof_score = 1.0 - prob[0].item()
+
+                        # Binary label for HTER calculation: 0 is Live, >0 is Attack
+                        binary_label = 1 if label.item() > 0 else 0
+
+                        list_scores.append("{} {}\n".format(spoof_score, binary_label))
 
                 test_ACC, tpr_filtered_1p, HTER, auc_test, val_threshold, val_ece, val_acc, sc, la = eval(list_scores)
                 print(
