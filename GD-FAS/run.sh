@@ -3,7 +3,7 @@
 python training.py --backbone clip --gs --temperature 0.1 --protocol C_FAS_to_C_FAS --save --log_name MyCustomFAS_Run --data_root dataset
 
 
-python training.py --backbone clip --gs --temperature 0.1 --data_root dataset/CrossVal/Fold1 --log_name Run_Fold1
+python training.py --backbone clip --gs --temperature 0.1 --protocol C_FAS_to_C_FAS --data_root dataset/CrossVal/Fold1 --log_name Run_Fold1
 
 python training.py --backbone clip --gs --temperature 0.1 --data_root dataset/CrossVal/Fold2 --log_name Run_Fold2
 

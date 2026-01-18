@@ -3,9 +3,9 @@ import shutil
 from pathlib import Path
 
 # ================= CONFIGURATION =================
-SOURCE_ROOT = r"D:\CODIng\Machine Learning\FAS\GD-FAS\dataset\FAS"
+SOURCE_ROOT = r"D:\CODIng\Machine Learning\FAS\GD-FAS\dataset\cutout"
 # This will create 'dataset/Fold1', 'dataset/Fold2', 'dataset/Fold3'
-OUTPUT_ROOT = r"D:\CODIng\Machine Learning\FAS\GD-FAS\dataset\CrossVal"
+OUTPUT_ROOT = r"D:\CODIng\Machine Learning\FAS\GD-FAS\dataset\CrossValCutout"
 DATASET_NAME = "CustomFAS"
 
 # Define your 3 Folds manually to ensure balance
