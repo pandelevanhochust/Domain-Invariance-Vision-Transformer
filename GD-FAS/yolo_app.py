@@ -32,7 +32,7 @@ class Config:
     def __init__(self):
         self.backbone = 'clip'
         self.gs = True
-        self.num_classes = 2
+        self.num_classes = 3
         self.temperature = 0.1
         self.lambda_1 = 0.1
         self.lambda_2 = 0.1
@@ -105,22 +105,17 @@ class InferenceWorker(QThread):
 
                         if best_box:
                             x1, y1, x2, y2 = best_box
-
                             h, w, _ = frame.shape
                             x1, y1 = max(0, x1), max(0, y1)
                             x2, y2 = min(w, x2), min(h, y2)
 
                             if x2 > x1 and y2 > y1:
                                 detected = True
-
-                                # Crop Face
                                 face_crop = frame[y1:y2, x1:x2]
 
-                                # --- RUN FAS MODEL ON GPU (This works fine!) ---
+                                # --- FAS MODEL INFERENCE ---
                                 rgb_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
                                 pil_img = Image.fromarray(rgb_crop)
-
-                                # Transform on CPU, then move to GPU
                                 input_tensor = self.transform(pil_img).unsqueeze(0).to(self.device)
 
                                 with torch.no_grad():
@@ -134,16 +129,24 @@ class InferenceWorker(QThread):
                                     conf, preds = torch.max(probs, 1)
                                     conf_value = conf.item()
 
+                                    # --- BUG FIX 1: Define 'idx' ---
+                                    idx = preds.item()
+
+                                    # --- BUG FIX 2: Define Colors correctly ---
                                     if idx == 0:
                                         label_text = "LIVE"
-                                        color = (0, 255, 0)  # Green
+                                        cv_color = (0, 255, 0)  # Green for OpenCV
+                                        box_color = "#d4edda"  # Hex for UI
                                     elif idx == 1:
                                         label_text = "CUT-OUT"
-                                        color = (0, 255, 255)  # Yellow/Cyan
+                                        cv_color = (255, 255, 0)  # Cyan/Yellow
+                                        box_color = "#fff3cd"
                                     elif idx == 2:
                                         label_text = "REPLAY"
-                                        color = (0, 0, 255)  # Red
+                                        cv_color = (0, 0, 255)  # Red
+                                        box_color = "#f8d7da"
 
+                                # Draw rectangle using the defined cv_color
                                 cv2.rectangle(frame, (x1, y1), (x2, y2), cv_color, 2)
                                 cv2.putText(frame, f"{label_text}", (x1, y1 - 10),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, cv_color, 2)
@@ -200,7 +203,7 @@ class FASWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Model build failed: {e}")
             return None
 
-        model_path = "results/Run_Fold1/Custom_to_Custom_best.pth"
+        model_path = "results/Run_Unified_MultiClass/Custom_to_Custom_best.pth"
         if os.path.exists(model_path):
             try:
                 print(f"Loading weights from {model_path}...")
