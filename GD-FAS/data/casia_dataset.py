@@ -1,4 +1,6 @@
 import os
+import random
+
 import cv2
 import torch
 from torch.utils.data import Dataset
@@ -88,35 +90,35 @@ class CefaAFDataset(Dataset):
         self.phase = phase
         self.transform = transform
         self.data_list = []
-        
+
         # Point to the AF folder inside CeFA-Race
         af_root = os.path.join(root_dir, 'AF')
         print(f"Scanning CeFA-AF Subset in {af_root}...")
-        
+
         if os.path.exists(af_root):
             for subject in os.listdir(af_root):
                 subj_path = os.path.join(af_root, subject)
                 if not os.path.isdir(subj_path): continue
-                
+
                 for seq_name in os.listdir(subj_path):
                     seq_path = os.path.join(subj_path, seq_name)
-                    
+
                     # Parse Label: 1_000_1... -> Type is 3rd number
                     parts = seq_name.split('_')
                     if len(parts) < 3: continue
-                    attack_type = parts[2] 
-                    
+                    attack_type = parts[2]
+
                     # 1=Live, 2=Print, 3=Replay, 4=Mask
-                    label = 0 if attack_type == '1' else 1 
-                    
+                    label = 0 if attack_type == '1' else 1
+
                     # Find folders
                     rgb_dir = os.path.join(seq_path, 'profile')
                     ir_dir = os.path.join(seq_path, 'ir')
-                    
+
                     if os.path.exists(rgb_dir) and os.path.exists(ir_dir):
                         rgb_files = sorted([f for f in os.listdir(rgb_dir) if f.endswith('.jpg')])
                         ir_files = sorted([f for f in os.listdir(ir_dir) if f.endswith('.jpg')])
-                        
+
                         min_len = min(len(rgb_files), len(ir_files))
                         for i in range(min_len):
                             self.data_list.append({
@@ -134,7 +136,7 @@ class CefaAFDataset(Dataset):
             img_rgb = Image.open(sample['rgb']).convert('RGB')
             img_ir = Image.open(sample['ir']).convert('L').convert('RGB')
         except:
-            return self.__getitem__(random.randint(0, len(self.data_list)-1))
+            return self.__getitem__(random.randint(0, len(self.data_list) - 1))
 
         if self.transform:
             img_rgb = self.transform(img_rgb)

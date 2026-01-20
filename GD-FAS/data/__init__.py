@@ -1,8 +1,9 @@
 from .casia_dataset import CasiaSurfDataset, CefaAFDataset
 from .facedataset import FaceDataset, BalanceFaceDataset
-from torch.utils.data import DataLoader, ConcatDataset # <--- Added ConcatDataset
+from torch.utils.data import DataLoader, ConcatDataset  # <--- Added ConcatDataset
 from torchvision import transforms
 import os
+
 
 def protocol_decoder(protocol):
     MAP = {
@@ -30,10 +31,16 @@ def protocol_decoder(protocol):
     train_protocols, test_protocols = protocol.split('_to_')
     train_protocols = train_protocols.split('_')
     test_protocols = test_protocols.split('_')
-    return [MAP[train_protocol] for train_protocol in train_protocols], [MAP[test_protocol] for test_protocol in                                   test_protocols]
+    return [MAP[train_protocol] for train_protocol in train_protocols], [MAP[test_protocol] for test_protocol in
+                                                                         test_protocols]
 
 
 def get_transform(backbone):
+    # Standard Normalization for CLIP / ResNet
+    # Using CLIP specific mean/std is often better for CLIP backbones:
+    # mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711)
+    # But ImageNet mean/std (below) works fine too.
+
     if 'resnet' in backbone:
         train_transform = transforms.Compose([
             transforms.RandomRotation(degrees=(-180, 180)),
@@ -73,15 +80,15 @@ def build_datasets(args):
     # --- NEW LOGIC FOR CASIA (DUAL STREAM + CEFA) ---
     if "CASIA" in args.protocol:
         print(f"Loading CASIA-SURF + CeFA Dataset (Dual Stream)...")
-        
+
         # 1. Load CASIA-SURF (From command line arg path)
         surf_train = CasiaSurfDataset(args.data_root, phase='train', transform=train_transform)
-        
+
         # 2. Load CeFA-AF
         # ⚠️ IMPORTANT: Update this string to match your actual local path to CeFA-Race
         cefa_root = os.path.join(os.path.dirname(args.data_root), "CeFA", "CeFA-Race")
         # Alternative: cefa_root = "dataset/CeFA/CeFA-Race"
-        
+
         if os.path.exists(cefa_root):
             cefa_train = CefaAFDataset(cefa_root, phase='train', transform=train_transform)
             # Combine
@@ -92,12 +99,15 @@ def build_datasets(args):
             combined_train = surf_train
 
         # CASIA doesn't support domain generalization logic yet, set num_domain to 1
-        args.num_domain = 1 
-        
+        args.num_domain = 1
+
+        train_loader = DataLoader(combined_train, batch_size=args.batch_size, shuffle=True, num_workers=4,
+                                  drop_last=True)
+
+        # Test set: Just use CASIA-SURF for consistent benchmarking
         test_dataset = CasiaSurfDataset(args.data_root, phase='test', transform=test_transform)
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-        
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+
         return train_loader, test_loader
     # -----------------------------------------
 
@@ -109,7 +119,7 @@ def build_datasets(args):
                                        args.max_iter * args.batch_size, not args.silence)
     test_dataset = FaceDataset(args.data_root, test_protocol_names, 'test', test_transform, not args.silence)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     return train_loader, test_loader
