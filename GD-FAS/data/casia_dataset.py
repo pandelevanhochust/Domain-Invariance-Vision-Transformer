@@ -81,3 +81,68 @@ class CasiaSurfDataset(Dataset):
             "label": sample_info['label'],
             "name": sample_info['rgb']
         }
+
+class CefaAFDataset(Dataset):
+    def __init__(self, root_dir, phase='train', transform=None):
+        self.root_dir = root_dir
+        self.phase = phase
+        self.transform = transform
+        self.data_list = []
+        
+        # Point to the AF folder inside CeFA-Race
+        af_root = os.path.join(root_dir, 'AF')
+        print(f"Scanning CeFA-AF Subset in {af_root}...")
+        
+        if os.path.exists(af_root):
+            for subject in os.listdir(af_root):
+                subj_path = os.path.join(af_root, subject)
+                if not os.path.isdir(subj_path): continue
+                
+                for seq_name in os.listdir(subj_path):
+                    seq_path = os.path.join(subj_path, seq_name)
+                    
+                    # Parse Label: 1_000_1... -> Type is 3rd number
+                    parts = seq_name.split('_')
+                    if len(parts) < 3: continue
+                    attack_type = parts[2] 
+                    
+                    # 1=Live, 2=Print, 3=Replay, 4=Mask
+                    label = 0 if attack_type == '1' else 1 
+                    
+                    # Find folders
+                    rgb_dir = os.path.join(seq_path, 'profile')
+                    ir_dir = os.path.join(seq_path, 'ir')
+                    
+                    if os.path.exists(rgb_dir) and os.path.exists(ir_dir):
+                        rgb_files = sorted([f for f in os.listdir(rgb_dir) if f.endswith('.jpg')])
+                        ir_files = sorted([f for f in os.listdir(ir_dir) if f.endswith('.jpg')])
+                        
+                        min_len = min(len(rgb_files), len(ir_files))
+                        for i in range(min_len):
+                            self.data_list.append({
+                                'rgb': os.path.join(rgb_dir, rgb_files[i]),
+                                'ir': os.path.join(ir_dir, ir_files[i]),
+                                'label': label
+                            })
+
+    def __len__(self):
+        return len(self.data_list)
+
+    def __getitem__(self, idx):
+        sample = self.data_list[idx]
+        try:
+            img_rgb = Image.open(sample['rgb']).convert('RGB')
+            img_ir = Image.open(sample['ir']).convert('L').convert('RGB')
+        except:
+            return self.__getitem__(random.randint(0, len(self.data_list)-1))
+
+        if self.transform:
+            img_rgb = self.transform(img_rgb)
+            img_ir = self.transform(img_ir)
+
+        return {
+            "image_x": img_rgb,
+            "image_ir": img_ir,
+            "label": sample['label'],
+            "name": sample['rgb']
+        }

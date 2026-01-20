@@ -1,8 +1,8 @@
-from .facedataset import BalanceFaceDataset, FaceDataset
-from .casia_dataset import CasiaSurfDataset  # <--- IMPORT THE NEW CLASS
-from torch.utils.data import DataLoader
+from .casia_dataset import CasiaSurfDataset, CefaAFDataset
+from .facedataset import FaceDataset, BalanceFaceDataset
+from torch.utils.data import DataLoader, ConcatDataset # <--- Added ConcatDataset
 from torchvision import transforms
-
+import os
 
 def protocol_decoder(protocol):
     MAP = {
@@ -30,8 +30,7 @@ def protocol_decoder(protocol):
     train_protocols, test_protocols = protocol.split('_to_')
     train_protocols = train_protocols.split('_')
     test_protocols = test_protocols.split('_')
-    return [MAP[train_protocol] for train_protocol in train_protocols], [MAP[test_protocol] for test_protocol in
-                                                                           test_protocols]
+    return [MAP[train_protocol] for train_protocol in train_protocols], [MAP[test_protocol] for test_protocol in                                   test_protocols]
 
 
 def get_transform(backbone):
@@ -71,16 +70,31 @@ def get_transform(backbone):
 def build_datasets(args):
     train_transform, test_transform = get_transform(args.backbone)
 
-    # --- NEW LOGIC FOR CASIA (DUAL STREAM) ---
+    # --- NEW LOGIC FOR CASIA (DUAL STREAM + CEFA) ---
     if "CASIA" in args.protocol:
-        print(f"Loading CASIA-SURF Dataset (Dual Stream) from: {args.data_root}")
-        # Note: CasiaSurfDataset doesn't need 'protocol_names' list, just root + phase
-        train_dataset = CasiaSurfDataset(args.data_root, phase='train', transform=train_transform)
-        test_dataset = CasiaSurfDataset(args.data_root, phase='test', transform=test_transform)
+        print(f"Loading CASIA-SURF + CeFA Dataset (Dual Stream)...")
         
+        # 1. Load CASIA-SURF (From command line arg path)
+        surf_train = CasiaSurfDataset(args.data_root, phase='train', transform=train_transform)
+        
+        # 2. Load CeFA-AF
+        # ⚠️ IMPORTANT: Update this string to match your actual local path to CeFA-Race
+        cefa_root = os.path.join(os.path.dirname(args.data_root), "CeFA", "CeFA-Race")
+        # Alternative: cefa_root = "dataset/CeFA/CeFA-Race"
+        
+        if os.path.exists(cefa_root):
+            cefa_train = CefaAFDataset(cefa_root, phase='train', transform=train_transform)
+            # Combine
+            combined_train = ConcatDataset([surf_train, cefa_train])
+            print(f"Merged: {len(surf_train)} SURF + {len(cefa_train)} CeFA = {len(combined_train)} Total")
+        else:
+            print(f"⚠️ Warning: CeFA path not found at {cefa_root}. Using only CASIA-SURF.")
+            combined_train = surf_train
+
         # CASIA doesn't support domain generalization logic yet, set num_domain to 1
         args.num_domain = 1 
         
+        test_dataset = CasiaSurfDataset(args.data_root, phase='test', transform=test_transform)
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
         
