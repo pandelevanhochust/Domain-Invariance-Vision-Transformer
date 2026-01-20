@@ -24,7 +24,7 @@ def log_f(f, console=True):
 def parse_args():
     parser = argparse.ArgumentParser()
     # build dirs
-    parser.add_argument('--backbone', type=str, default="clip", help='backbone - resnet18 or clip')
+    parser.add_argument('--backbone', type=str, default="clip", help='backbone - resnet18, clip, or dual_clip')
     parser.add_argument('--silence', action='store_true')
     parser.add_argument('--log_name', type=str, default="test", help='log')
     parser.add_argument('--seed', type=int, default=2025, help='')
@@ -41,6 +41,10 @@ def parse_args():
     parser.add_argument('--temperature', type=float, default=0.1, help='')
     parser.add_argument('--params', nargs=4, type=float, default=[1.0, 0.8, 0.1, 1.0])
     parser.add_argument('--step_size', type=int, default=10, help='')
+    
+    # ADDED: Support for multi-class (2 or 3)
+    parser.add_argument('--num_classes', type=int, default=2, help='2 for binary, 3 for multi-class')
+    
     return parser.parse_args()
 
 
@@ -87,6 +91,7 @@ def main(args):
         print(f'{"gs":20} : {args.gs}')
         print(f'{"beta":20} : {args.beta}')
         print(f'{"temperature":20} : {args.temperature}')
+        print(f'{"num classes":20} : {args.num_classes}')
         print(f'{"parameter1":20} : {args.params[0]}')
         print(f'{"parameter2":20} : {args.params[1]}')
         print(f'{"parameter3":20} : {args.params[2]}')
@@ -96,22 +101,44 @@ def main(args):
         print('------------------------------------------------------')
 
     best_select = [1, ""]
+    
     for iter, batch_samples in enumerate(train_loader):
-        print(f"Processing batch {iter}...")
+        # Optional: Uncomment if you want to see progress every batch
+        # print(f"Processing batch {iter}...")
+        
         epoch = iter // 10
         networks.train()
         optimizer.zero_grad()
-
-        image_x_v1 = torch.cat([batch_samples[key]['image_x_v1'] for key in batch_samples])
-        image_x_v2 = torch.cat([batch_samples[key]['image_x_v2'] for key in batch_samples])
-
         device = next(networks.parameters()).device
-        images = torch.cat([image_x_v1, image_x_v2]).to(device)
-        labels = torch.cat([batch_samples[key]['label'] for key in batch_samples]).repeat(2).to(device)
-        domains = torch.cat([batch_samples[key]['domain'] for key in batch_samples]).repeat(2).to(device)
 
-        loss = networks.compute_loss(images, labels, domains)
-        # break
+        # --- LOGIC SPLIT: DUAL STREAM (CASIA) vs SINGLE STREAM ---
+        if isinstance(batch_samples, dict) and 'image_ir' in batch_samples:
+            # === CASE 1: Dual Stream (RGB + IR) ===
+            image_rgb = batch_samples['image_x'].to(device)
+            image_ir = batch_samples['image_ir'].to(device)
+            labels = batch_samples['label'].to(device)
+            
+            # Create dummy domains (CASIA doesn't strictly use domain labels here)
+            domains = torch.zeros_like(labels).to(device)
+            
+            # Compute Loss (Requires 4 args for DualStream)
+            loss = networks.compute_loss(image_rgb, image_ir, labels, domains)
+
+        else:
+            # === CASE 2: Single Stream (Original) ===
+            # This handles 'BalanceFaceDataset' which returns nested dicts
+            image_x_v1 = torch.cat([batch_samples[key]['image_x_v1'] for key in batch_samples])
+            image_x_v2 = torch.cat([batch_samples[key]['image_x_v2'] for key in batch_samples])
+
+            images = torch.cat([image_x_v1, image_x_v2]).to(device)
+            labels = torch.cat([batch_samples[key]['label'] for key in batch_samples]).repeat(2).to(device)
+            domains = torch.cat([batch_samples[key]['domain'] for key in batch_samples]).repeat(2).to(device)
+
+            # Compute Loss (Standard 3 args)
+            loss = networks.compute_loss(images, labels, domains)
+
+        # ---------------------------------------------------------
+
         loss.backward()
         optimizer.step()
 
@@ -119,21 +146,44 @@ def main(args):
             scheduler.step()
             infos = networks.loss_reset()
             print(f'epoch : {epoch} {infos["loss"]}')
-            print(
-                '------------------------------------------------------------------------------------------------------------')
-            list_scores = {}
+            print('------------------------------------------------------------------------------------------------------------')
+            
+            # --- EVALUATION LOOP ---
+            list_scores = []
             networks.eval()
             with torch.no_grad():
-                list_scores = []
-                for test_batch_samples in test_loader:
+                for test_batch in test_loader:
                     device = next(networks.parameters()).device
-                    images = test_batch_samples['image_x'].to(device)
-                    labels = test_batch_samples['label'].to(device)
-                    logits, _ = networks(images)
-                    # probs1 = torch.nn.functional.softmax(similarity, dim=1)
+                    lbl = test_batch['label'].to(device)
+
+                    # Check for Dual Stream Data
+                    if 'image_ir' in test_batch:
+                         img_rgb = test_batch['image_x'].to(device)
+                         img_ir = test_batch['image_ir'].to(device)
+                         logits = networks(img_rgb, img_ir)
+                    else:
+                         images = test_batch['image_x'].to(device)
+                         # Returns tuple (logits, classifier_out) or just logits depending on model
+                         outputs = networks(images)
+                         if isinstance(outputs, tuple):
+                             logits = outputs[0]
+                         else:
+                             logits = outputs
+
+                    # Calculate Probabilities
                     probs = torch.nn.functional.softmax(logits, dim=1)
-                    for prob, label in zip(probs, labels):
-                        list_scores.append("{} {}\n".format(prob[1].item(), label.item()))
+                    
+                    for prob, label in zip(probs, lbl):
+                        # SCORE CALCULATION:
+                        # prob[0] is Live, prob[1] is Attack (in binary)
+                        # In multi-class, prob[0]=Live, prob[1]=Cutout, prob[2]=Replay
+                        # Universal Spoof Score = 1.0 - Prob(Live)
+                        spoof_score = 1.0 - prob[0].item()
+                        
+                        # Binary Label for HTER (0=Live, 1=Spoof)
+                        binary_label = 1 if label.item() > 0 else 0
+                        
+                        list_scores.append("{} {}\n".format(spoof_score, binary_label))
 
                 test_ACC, tpr_filtered_1p, HTER, auc_test, val_threshold, val_ece, val_acc, sc, la = eval(list_scores)
                 print(
@@ -149,8 +199,7 @@ def main(args):
                         torch.save(networks, f'results/{args.log_name}/{args.protocol}_best.pth')
 
                 print(f'best_hter: {best_select[0]:.4f}')
-                print(
-                    '------------------------------------------------------------------------------------------------------------')
+                print('------------------------------------------------------------------------------------------------------------')
     print(best_select[1])
 
 

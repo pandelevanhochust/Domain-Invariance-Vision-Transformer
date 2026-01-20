@@ -180,6 +180,78 @@ class resnet(nn.Module):
         features = F.normalize(self.model(input).squeeze())
         return self.classifier(features) + 0.5
     
+class DualStreamCLIP(nn.Module):
+    def __init__(self, args):
+        super(DualStreamCLIP, self).__init__()
+        
+        print("Initializing RGB CLIP Stream...")
+        self.rgb_stream = clip_encoder(args)
+        
+        print("Initializing IR CLIP Stream...")
+        self.ir_stream = clip_encoder(args)
+        
+        # Fusion Layer
+        # Concatenates RGB features (256) + IR features (256) -> 512
+        # Then maps to num_classes (2 or 3)
+        self.fusion_head = nn.Sequential(
+            nn.Linear(256 + 256, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(256, args.num_classes)
+        )
+        
+        # Track fusion loss
+        self.fusion_loss_meter = AverageMeter()
+
+    def forward(self, x_rgb, x_ir):
+        # 1. Extract RGB Features
+        # We bypass the final classifier of the individual stream and just get the embeddings
+        feat_rgb = self.rgb_stream.model.encode_image(x_rgb)
+        embed_rgb = self.rgb_stream.image_mlp(feat_rgb)
+        embed_rgb = embed_rgb / embed_rgb.norm(dim=-1, keepdim=True) # Normalize
+
+        # 2. Extract IR Features
+        feat_ir = self.ir_stream.model.encode_image(x_ir)
+        embed_ir = self.ir_stream.image_mlp(feat_ir)
+        embed_ir = embed_ir / embed_ir.norm(dim=-1, keepdim=True) # Normalize
+
+        # 3. Concatenate (Fuse)
+        combined = torch.cat((embed_rgb, embed_ir), dim=1)
+        
+        # 4. Classify
+        logits = self.fusion_head(combined)
+        return logits
+
+    def compute_loss(self, x_rgb, x_ir, labels, domains):
+        # STRATEGY: Train both individual streams AND the fusion head simultaneously
+        
+        # 1. RGB Stream Loss (Uses your text-matching logic)
+        loss_rgb = self.rgb_stream.compute_loss(x_rgb, labels, domains)
+        
+        # 2. IR Stream Loss (Learns text-matching for IR images too!)
+        loss_ir = self.ir_stream.compute_loss(x_ir, labels, domains)
+        
+        # 3. Fusion Loss
+        logits = self.forward(x_rgb, x_ir)
+        loss_fusion = torch.nn.functional.cross_entropy(logits, labels)
+        self.fusion_loss_meter.update(loss_fusion.item())
+        
+        # Combined Loss
+        # You can weigh these if you want, e.g., 0.5 * rgb + 0.5 * ir + 1.0 * fusion
+        total_loss = loss_rgb + loss_ir + loss_fusion
+        return total_loss
+        
+    def loss_reset(self):
+        # Helper to print all losses
+        info_rgb = self.rgb_stream.loss_reset() # Get RGB logs
+        loss_fusion = self.fusion_loss_meter.avg
+        self.fusion_loss_meter.reset()
+        
+        return {
+            "loss": f"Fusion: {loss_fusion:.4f} | RGB: {info_rgb['loss']}" 
+        }
+
 class clip_encoder(nn.Module):
     def __init__(self, args):
         super(clip_encoder, self).__init__()
