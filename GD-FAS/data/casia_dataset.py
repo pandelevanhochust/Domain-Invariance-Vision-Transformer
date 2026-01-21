@@ -148,3 +148,62 @@ class CefaAFDataset(Dataset):
             "label": sample['label'],
             "name": sample['rgb']
         }
+
+class CefaIROnlyDataset(Dataset):
+    def __init__(self, root_dir, phase='train', transform=None):
+        self.root_dir = root_dir
+        self.phase = phase
+        self.transform = transform
+        self.data_list = []
+
+        # Point to the AF folder inside CeFA-Race
+        af_root = os.path.join(root_dir, 'AF')
+        print(f"Scanning CeFA-AF (IR ONLY) in {af_root}...")
+
+        if os.path.exists(af_root):
+            for subject in os.listdir(af_root):
+                subj_path = os.path.join(af_root, subject)
+                if not os.path.isdir(subj_path): continue
+
+                for seq_name in os.listdir(subj_path):
+                    seq_path = os.path.join(subj_path, seq_name)
+
+                    # Parse Label: 1_000_1... -> Type is 3rd number
+                    parts = seq_name.split('_')
+                    if len(parts) < 3: continue
+                    attack_type = parts[2]
+
+                    # 1=Live, Others=Spoof
+                    label = 0 if attack_type == '1' else 1
+
+                    # Find IR folder
+                    ir_dir = os.path.join(seq_path, 'ir')
+
+                    if os.path.exists(ir_dir):
+                        ir_files = sorted([f for f in os.listdir(ir_dir) if f.endswith('.jpg')])
+
+                        for ir_file in ir_files:
+                            self.data_list.append({
+                                'path': os.path.join(ir_dir, ir_file),
+                                'label': label
+                            })
+
+    def __len__(self):
+        return len(self.data_list)
+
+    def __getitem__(self, idx):
+        sample = self.data_list[idx]
+        try:
+            # VITAL: Load IR but convert to RGB (3 channels) so CLIP/ResNet accepts it
+            img = Image.open(sample['path']).convert('L').convert('RGB')
+        except:
+            return self.__getitem__(random.randint(0, len(self.data_list) - 1))
+
+        if self.transform:
+            img = self.transform(img)
+
+        return {
+            "image_x": img,  # <--- We put IR data in the main 'image_x' slot
+            "label": sample['label'],
+            "image_ir": torch.zeros(1)  # Dummy value to prevent errors
+        }

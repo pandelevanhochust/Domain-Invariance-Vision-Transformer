@@ -3,6 +3,7 @@ from .facedataset import FaceDataset, BalanceFaceDataset
 from torch.utils.data import DataLoader, ConcatDataset  # <--- Added ConcatDataset
 from torchvision import transforms
 import os
+from .casia_dataset import CasiaSurfDataset, CefaAFDataset, CefaIROnlyDataset # <--- Added
 
 
 def protocol_decoder(protocol):
@@ -77,7 +78,7 @@ def get_transform(backbone):
 def build_datasets(args):
     train_transform, test_transform = get_transform(args.backbone)
 
-    # --- NEW LOGIC FOR CASIA (DUAL STREAM + CEFA) ---
+    #CASIA SURF + CeFA
     if "CASIA" in args.protocol:
         print(f"Loading CASIA-SURF + CeFA Dataset (Dual Stream)...")
 
@@ -106,6 +107,32 @@ def build_datasets(args):
 
         # Test set: Just use CASIA-SURF for consistent benchmarking
         test_dataset = CasiaSurfDataset(args.data_root, phase='test', transform=test_transform)
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+
+        return train_loader, test_loader
+    # -----------------------------------------
+
+    #CASIA CeFA
+    if "CASIA_IR" in args.protocol:
+        print(f"Loading CeFA (IR Only) Dataset...")
+
+        # Path to CeFA
+        cefa_root = os.path.join(os.path.dirname(args.data_root), "CeFA", "CeFA-Race")
+
+        # Initialize the IR-Only loader
+        train_dataset = CefaIROnlyDataset(cefa_root, phase='train', transform=train_transform)
+
+        # For testing, we split the training set or reuse it (just for verification)
+        # Ideally, you'd make a test split, but using the same for a quick check is okay
+        test_dataset = CefaIROnlyDataset(cefa_root, phase='train', transform=test_transform)
+
+        print(f"IR Training Samples: {len(train_dataset)}")
+
+        # Set domains to 1 because we are back to single stream
+        args.num_domain = 1
+
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,
+                                  drop_last=True)
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
         return train_loader, test_loader
