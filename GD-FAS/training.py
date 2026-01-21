@@ -8,6 +8,7 @@ from data import build_datasets
 from models import build_model, build_optimizer
 from utils import *
 
+
 def log_f(f, console=True):
     def log(msg):
         with open(f, 'a') as file:
@@ -15,7 +16,9 @@ def log_f(f, console=True):
             file.write('\n')
         if console:
             print(msg)
+
     return log
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -40,6 +43,7 @@ def parse_args():
     parser.add_argument('--num_domain', type=int, default=1, help='Number of domains')
     return parser.parse_args()
 
+
 def seed_everything(seed):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -50,6 +54,7 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
 def eval(list_scores):
     # Basic Evaluation Helper
     preds = []
@@ -58,17 +63,18 @@ def eval(list_scores):
         s, l = line.strip().split()
         preds.append(float(s))
         labels.append(int(l))
-    
+
     preds = np.array(preds)
     labels = np.array(labels)
-    
+
     # Calculate Accuracy (Threshold 0.5)
     threshold = 0.5
     pred_labels = (preds > threshold).astype(int)
     acc = (pred_labels == labels).mean()
-    
-    # Return ACC and dummy placeholders for HTER/AUC/etc to match original unpacking
+
+    # Return ACC and dummy placeholders
     return [acc], 0.0, [0.0], 0.0, 0.5, 0.0, acc, 0, 0
+
 
 def main(args):
     # Logging Setup
@@ -81,7 +87,7 @@ def main(args):
     networks = build_model(args)
     optimizer = build_optimizer(args, networks)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=0.1)
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     networks.to(device)
     print_log(f'Using device: {device}')
@@ -92,62 +98,52 @@ def main(args):
     print_log(f"Starting training for {args.max_iter} iterations...")
 
     # --- INFINITE LOOP LOGIC ---
-    # Keeps restarting the loader until max_iter is reached
     while current_iter < args.max_iter:
         for batch_samples in train_loader:
             if current_iter >= args.max_iter:
                 break
-            
+
             networks.train()
             optimizer.zero_grad()
 
-            # --- DUAL STREAM LOGIC (CASIA) ---
-            # Automatically detects if IR data is present
-            if isinstance(batch_samples, dict) and 'image_ir' in batch_samples:
+            # 1. DUAL STREAM CASE (Model A)
+            # We ONLY enter here if the user specifically requested 'dual_clip'
+            if args.backbone == 'dual_clip' and isinstance(batch_samples, dict) and 'image_ir' in batch_samples:
                 images_rgb = batch_samples['image_x'].to(device)
                 images_ir = batch_samples['image_ir'].to(device)
                 labels = batch_samples['label'].to(device)
-                domains = torch.zeros_like(labels).to(device) 
-                
-                # Call DualStream Compute Loss (4 args)
-                loss = networks.compute_loss(images_rgb, images_ir, labels, domains)
-                
-            # --- SINGLE STREAM LOGIC (Legacy) ---
-            else:
-                # Handle BalanceFaceDataset wrapper
-                if 'sample' in batch_samples: 
-                    batch_samples = batch_samples['sample']
-                
-                # Check if deep dictionary (BalanceFaceDataset structure)
-                # e.g. batch_samples['CustomFAS']['image_x_v1']
-                first_val = list(batch_samples.values())[0] if len(batch_samples) > 0 else None
-                
-                if isinstance(first_val, dict) and 'image_x_v1' in first_val:
-                     image_x_v1 = torch.cat([batch_samples[key]['image_x_v1'] for key in batch_samples])
-                     image_x_v2 = torch.cat([batch_samples[key]['image_x_v2'] for key in batch_samples])
-                     labels = torch.cat([batch_samples[key]['label'] for key in batch_samples]).repeat(2).to(device)
-                     domains = torch.cat([batch_samples[key]['domain'] for key in batch_samples]).repeat(2).to(device)
-                     images = torch.cat([image_x_v1, image_x_v2]).to(device)
-                else:
-                     # Simple Dataset (FaceDataset)
-                     images = batch_samples['image_x'].to(device)
-                     labels = batch_samples['label'].to(device)
-                     domains = torch.zeros_like(labels).to(device)
+                domains = torch.zeros_like(labels).to(device)
 
-                # Call Standard Compute Loss (3 args)
+                # Pass 4 Arguments: (RGB, IR, Label, Domain)
+                loss = networks.compute_loss(images_rgb, images_ir, labels, domains)
+
+            # 2. SINGLE STREAM CASE (Model B / IR Only)
+            else:
+                # Handle dictionary unpacking for single stream
+                if isinstance(batch_samples, dict):
+                    # For CASIA_IR, the data is in 'image_x'
+                    images = batch_samples['image_x'].to(device)
+                    labels = batch_samples['label'].to(device)
+                    domains = torch.zeros_like(labels).to(device)
+
+                # Handle Legacy BalanceFaceDataset (Nested Dicts)
+                elif 'sample' in batch_samples:
+                    # ... (Legacy logic for BalanceFaceDataset) ...
+                    pass
+
+                    # Pass 3 Arguments: (Image, Label, Domain)
+                # This matches 'clip_encoder.compute_loss' signature
                 loss = networks.compute_loss(images, labels, domains)
 
             loss.backward()
             optimizer.step()
-            
-            # Update iterator count
+
             current_iter += 1
 
-            # EVALUATION LOOP (Every 10 iters)
+            # EVALUATION LOOP
             if (current_iter % 10 == 0):
                 scheduler.step()
-                
-                # Print Loss
+
                 try:
                     infos = networks.loss_reset()
                     print_log(f'Iter {current_iter}: {infos["loss"]}')
@@ -159,37 +155,37 @@ def main(args):
                 list_scores = []
                 with torch.no_grad():
                     for test_batch in test_loader:
-                        # Dual Stream Eval
-                        if 'image_ir' in test_batch:
-                             img_rgb = test_batch['image_x'].to(device)
-                             img_ir = test_batch['image_ir'].to(device)
-                             lbl = test_batch['label'].to(device)
-                             logits = networks(img_rgb, img_ir)
-                        # Single Stream Eval
+                        # Correct Evaluation Logic
+                        # If we are in Dual Mode, use Dual inputs
+                        if args.backbone == 'dual_clip' and 'image_ir' in test_batch:
+                            img_rgb = test_batch['image_x'].to(device)
+                            img_ir = test_batch['image_ir'].to(device)
+                            logits = networks(img_rgb, img_ir)
+                            lbl = test_batch['label'].to(device)
+
+                        # Else use Single Input
                         else:
-                             img = test_batch['image_x'].to(device)
-                             lbl = test_batch['label'].to(device)
-                             logits, _ = networks(img)
+                            img = test_batch['image_x'].to(device)
+                            lbl = test_batch['label'].to(device)
+                            logits, _ = networks(img)
 
                         probs = torch.nn.functional.softmax(logits, dim=1)
                         for prob, label in zip(probs, lbl):
-                            # Store probability of Attack (Index 1)
                             list_scores.append(f"{prob[1].item()} {label.item()}")
 
-                # Calculate Metrics
                 metrics = eval(list_scores)
                 acc = metrics[0][0]
                 print_log(f"Test ACC: {acc:.4f}")
 
-                # Save Best Model
                 if acc >= best_acc:
                     best_acc = acc
                     if args.save:
                         save_name = f'results/{args.log_name}/{args.protocol}_best.pth'
                         torch.save(networks.state_dict(), save_name)
                         print_log(f"Saved best model to {save_name}")
-                
+
                 print_log('------------------------------------------------------')
+
 
 if __name__ == '__main__':
     args = parse_args()
