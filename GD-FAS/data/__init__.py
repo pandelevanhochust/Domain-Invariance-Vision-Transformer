@@ -79,7 +79,7 @@ def build_datasets(args):
     train_transform, test_transform = get_transform(args.backbone)
 
     #CASIA SURF + CeFA
-    if "CASIA" in args.protocol:
+    if args.protocol == "CASIA":
         print(f"Loading CASIA-SURF + CeFA Dataset (Dual Stream)...")
 
         # 1. Load CASIA-SURF (From command line arg path)
@@ -113,7 +113,7 @@ def build_datasets(args):
     # -----------------------------------------
 
     #CASIA CeFA
-    if "CASIA_IR" in args.protocol:
+    if args.protocol == "CASIA_IR":
         print(f"Loading CeFA (IR Only) Dataset...")
 
         # Path to CeFA
