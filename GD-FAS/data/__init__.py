@@ -102,12 +102,12 @@ def build_datasets(args):
         # CASIA doesn't support domain generalization logic yet, set num_domain to 1
         args.num_domain = 1
 
-        train_loader = DataLoader(combined_train, batch_size=args.batch_size, shuffle=True, num_workers=4,
+        train_loader = DataLoader(combined_train, batch_size=args.batch_size, shuffle=True, num_workers=2,
                                   drop_last=True)
 
         # Test set: Just use CASIA-SURF for consistent benchmarking
         test_dataset = CasiaSurfDataset(args.data_root, phase='test', transform=test_transform)
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
         return train_loader, test_loader
     # -----------------------------------------
@@ -131,9 +131,9 @@ def build_datasets(args):
         # Set domains to 1 because we are back to single stream
         args.num_domain = 1
 
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2,
                                   drop_last=True)
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
         return train_loader, test_loader
     # -----------------------------------------
@@ -146,7 +146,7 @@ def build_datasets(args):
                                        args.max_iter * args.batch_size, not args.silence)
     test_dataset = FaceDataset(args.data_root, test_protocol_names, 'test', test_transform, not args.silence)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
     return train_loader, test_loader

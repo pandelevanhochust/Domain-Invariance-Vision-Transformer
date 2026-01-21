@@ -141,7 +141,7 @@ def main(args):
             current_iter += 1
 
             # EVALUATION LOOP
-            if (current_iter % 10 == 0):
+            if (current_iter % 200 == 0):
                 scheduler.step()
 
                 try:
