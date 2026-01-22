@@ -15,75 +15,76 @@ LABEL_MAP = {
 class FaceDataset(Dataset):
     def __init__(self, root_dir, data_names, phase='test', transform=None, verbose=False):
         self.transform = transform
-        self.data_names = {}
         self.video_list = []
+
+        # CeFA Mapping: 1=Live(0), 2=Cutout(1), 3=Replay(2)
+        self.cefa_mapping = {'1': 0, '2': 1, '3': 2}
 
         if verbose:
             print('--------------------------------------------------')
-            print(f'{"build test dataset":20} - number of video')
+            print(f'Scanning TEST dataset for: {data_names}')
             print('--------------------------------------------------')
 
-        for num, data_name in enumerate(data_names):
-            self.data_names[data_name] = num
-
-            # 1. Determine the path to the phase folder (train/test)
-            # Try: dataset/Unified_FAS/CustomFAS/test
+        for data_name in data_names:
+            # 1. Determine Path
+            # Try specific phase path (e.g., dataset/CeFA/test)
             phase_path = os.path.join(root_dir, data_name, phase)
 
-            # If that doesn't exist, Try: dataset/Unified_FAS/test (Direct structure)
+            # If 'test' folder doesn't exist (like in your screenshot),
+            # fall back to the main folder (dataset/CeFA)
             if not os.path.exists(phase_path):
-                phase_path = os.path.join(root_dir, phase)
+                phase_path = os.path.join(root_dir, data_name)
 
             if not os.path.exists(phase_path):
                 print(f"Warning: Could not find path: {phase_path}")
                 continue
 
-            # 2. Walk through ALL subfolders (live, cutout, replay, etc.)
-            # This avoids hardcoding "attack" or "spoof"
-            files_found = 0
+            # 2. Walk and Find "profile" folders
             for root, dirs, files in os.walk(phase_path):
-                # If this folder contains images (frames), treat it as a video sample
-                # Your logic implies a "video" is a folder of images.
-                # We check if there are image files inside.
-                image_files = [f for f in os.listdir(root) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+                if os.path.basename(root) == 'profile':
+                    video_folder_path = root
+                    parent_folder_name = os.path.basename(os.path.dirname(root))
 
-                if len(image_files) > 0:
-                    # It's a valid sample folder
-                    self.video_list.append(root)
-                    files_found += 1
+                    # 3. Parse Label from Filename
+                    # Try to parse CeFA format: 1_001_1_1_1
+                    spoof_label = self.parse_cefa_label(parent_folder_name)
 
-            if verbose:
-                print(f'{phase_path}: Found {files_found} folders/videos')
+                    # If parsing failed, fallback to Folder Name check (for Unified_FAS support)
+                    if spoof_label is None:
+                        path_parts = root.lower().split(os.sep)
+                        if 'live' in path_parts:
+                            spoof_label = 0
+                        elif 'cutout' in path_parts:
+                            spoof_label = 1
+                        elif 'replay' in path_parts:
+                            spoof_label = 2
+
+                    # Only add if we found a valid label
+                    if spoof_label is not None:
+                        # We store the path and the label directly
+                        self.video_list.append((video_folder_path, spoof_label))
+
+        if verbose:
+            print(f'Found {len(self.video_list)} test videos.')
+
+    def parse_cefa_label(self, filename):
+        try:
+            # Check if filename ends with _1, _2, _3
+            parts = filename.split('_')
+            type_code = parts[-1]
+            return self.cefa_mapping.get(type_code, None)
+        except:
+            return None
 
     def __len__(self):
         return len(self.video_list)
 
     def __getitem__(self, idx):
-        video_name = self.video_list[idx]
+        # Retrieve path and label
+        video_name, spoofing_label = self.video_list[idx]
 
-        # --- MULTI-CLASS LABELING ---
-        spoofing_label = 0  # Default to Live
-
-        # Check path for keywords
-        path_parts = video_name.replace('\\', '/').lower().split('/')
-
-        # Find which label matches the folder name
-        for part in path_parts:
-            if part in LABEL_MAP:
-                spoofing_label = LABEL_MAP[part]
-                # If we found a specific attack type, stick with it.
-                if part != 'live':
-                    break
-
-                    # Domain Logic
-        domain_label = -1
-        for part in path_parts:
-            if part in self.data_names:
-                domain_label = self.data_names[part]
-                break
-
-        if domain_label == -1:
-            domain_label = 0
+        # Domain Logic (Default to 0 for single domain)
+        domain_label = 0
 
         image_x = self.sample_image(video_name)
         image_x = self.transform(image_x)
@@ -97,10 +98,8 @@ class FaceDataset(Dataset):
         return sample
 
     def sample_image(self, image_dir):
-        # Your original logic: assume image_dir is a folder of frames
         frames = [f for f in os.listdir(image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
         if len(frames) == 0:
-            # Fallback if folder is empty (prevent crash)
             return Image.new('RGB', (224, 224))
 
         frames_total = len(frames)
@@ -108,7 +107,6 @@ class FaceDataset(Dataset):
         image_path = os.path.join(image_dir, frames[image_id])
 
         return Image.open(image_path).convert('RGB')
-
 
 class BalanceFaceDataset(Dataset):
     def __init__(self, root_dir, data_names, phase='train', transform=None, max_iter=4000, verbose=False):
