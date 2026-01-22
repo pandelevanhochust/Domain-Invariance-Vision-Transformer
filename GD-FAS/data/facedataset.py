@@ -114,49 +114,80 @@ class BalanceFaceDataset(Dataset):
     def __init__(self, root_dir, data_names, phase='train', transform=None, max_iter=4000, verbose=False):
         self.transform = transform
         self.max_iter = max_iter
-        self.video_list = {}  # This will store iterators for each class folder
         self.data_names = {}
+
+        # We Initialize specific buckets for your 3 target classes
+        # This ensures the 'Balanced' logic works by forcing every batch to have
+        # one of each type.
+        self.video_list = {
+            'live': [],
+            'cutout': [],
+            'replay': []
+        }
+
+        # Mapping CeFA numeric codes (last digit) to your class buckets
+        # 1=Live, 2=Print(Cutout), 3=Replay, 4=3DMask(Ignored)
+        self.cefa_mapping = {
+            '1': 'live',
+            '2': 'cutout',
+            '3': 'replay'
+        }
+
+        print('--------------------------------------------------')
+        print(f' Scanning CeFA Dataset at: {root_dir}')
+        print('--------------------------------------------------')
 
         for num, data_name in enumerate(data_names):
             self.data_names[data_name] = num
 
-            # 1. Determine Path (Robust check)
-            phase_path = os.path.join(root_dir, data_name, phase)
+            # Construct path: e.g. dataset/CeFA/phase (if phase folders exist)
+            # Or just search the whole root if structure is flat
+            phase_path = os.path.join(root_dir, data_name)
             if not os.path.exists(phase_path):
-                phase_path = os.path.join(root_dir, phase)
+                # Fallback for simpler structure
+                phase_path = os.path.join(root_dir)
 
-            if not os.path.exists(phase_path):
-                print(f"Warning: Training path not found: {phase_path}")
-                continue
+            # --- NEW TRAVERSAL LOGIC ---
+            # We walk through the entire directory tree looking for "profile" folders.
+            # In CeFA, "profile" contains the RGB images.
+            for root, dirs, files in os.walk(phase_path):
 
-            # 2. Find ALL sub-folders (live, cutout, replay) in the directory
-            # We treat every immediate subfolder as a distinct class source
-            subfolders = [f.path for f in os.scandir(phase_path) if f.is_dir()]
+                # We only care about the folders that contain the actual images
+                # In CeFA, the RGB images are inside a folder named "profile"
+                if os.path.basename(root) == 'profile':
 
-            for folder_path in subfolders:
-                # Find all "video" directories inside this class folder
-                # Assuming structure: train/live/subject1_folder/frames...
-                # OR structure: train/live/image1.jpg (if flat)
+                    # The parent folder name holds the label info (e.g., "1_001_1_1_1")
+                    video_folder_path = root
+                    parent_folder_name = os.path.basename(os.path.dirname(root))
 
-                # Let's support your folder-based structure:
-                valid_videos = []
-                for root, dirs, files in os.walk(folder_path):
-                    # Check if this root contains images
-                    imgs = [f for f in os.listdir(root) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                    if len(imgs) > 0:
-                        valid_videos.append(root)
+                    # Parse the Label from the parent folder name
+                    label_key = self.parse_cefa_filename(parent_folder_name)
 
-                if len(valid_videos) > 0:
-                    random.shuffle(valid_videos)
-                    # Use the folder path as the key
-                    self.video_list[folder_path] = valid_videos
+                    # If it's a valid class (Live, Cutout, Replay), add it to the bucket
+                    if label_key in self.video_list:
+                        self.video_list[label_key].append(video_folder_path)
 
+        # Verbose output to verify data was found
         if verbose:
-            print('--------------------------------------------------')
-            print(f'{"build train dataset":20} - number of video sources')
+            print(f'{"Data Summary":20}')
             print('--------------------------------------------------')
             for key in self.video_list:
-                print(f'{key}: {len(self.video_list[key])}')
+                print(f'{key.capitalize()}: {len(self.video_list[key])} videos found')
+
+    def parse_cefa_filename(self, filename):
+        """
+        Parses strings like '1_001_1_1_1' or '1_001_3_1_4'
+        Splits by '_' and checks the last digit.
+        """
+        try:
+            parts = filename.split('_')
+            # The type is usually the last digit in CeFA filenames
+            # Format: Race_Subject_Session_Light_TYPE
+            type_code = parts[-1]
+
+            return self.cefa_mapping.get(type_code, None)
+        except:
+            return None
 
     def __len__(self):
         return self.max_iter
@@ -164,46 +195,41 @@ class BalanceFaceDataset(Dataset):
     def __getitem__(self, idx):
         sample = {}
 
-        # Iterate over every class folder we found (e.g., live, cutout, replay)
-        # This ensures the batch has 1 sample from EACH class type -> Balanced!
-        for video_key in self.video_list:
+        # Iterate over 'live', 'cutout', 'replay' buckets
+        # This guarantees every batch has 1 Live, 1 Cutout, 1 Replay
+        for class_name in self.video_list:
 
-            # Get next video from the list (or reshuffle if empty)
-            if len(self.video_list[video_key]) == 0:
-                continue  # Skip if empty
+            video_paths = self.video_list[class_name]
 
-            # Simple circular iterator logic manually
-            # We pick a random one for simplicity and robustness
-            video_name = random.choice(self.video_list[video_key])
+            # Safety check if a class is missing from dataset
+            if len(video_paths) == 0:
+                continue
 
-            # --- MULTI-CLASS LABELING ---
-            spoofing_label = 0
-            path_parts = video_name.replace('\\', '/').lower().split('/')
+            # Randomly select one video folder from this class
+            video_name = random.choice(video_paths)
 
-            for part in path_parts:
-                if part in LABEL_MAP:
-                    spoofing_label = LABEL_MAP[part]
-                    if part != 'live': break
-            # -----------------------------
+            # Determine Label ID (0, 1, 2)
+            # We map class_name string back to integer for the model
+            if class_name == 'live':
+                spoofing_label = 0
+            elif class_name == 'cutout':
+                spoofing_label = 1
+            elif class_name == 'replay':
+                spoofing_label = 2
+            else:
+                spoofing_label = 0  # Default
 
-            # Domain Logic
-            domain_label = -1
-            for part in path_parts:
-                if part in self.data_names:
-                    domain_label = self.data_names[part]
-                    break
-            if domain_label == -1:
-                domain_label = 0
+            # Domain Logic (simplified)
+            domain_label = 0
 
+            # Sample image from the folder
             image_x = self.sample_image(video_name)
+
+            # Create two augmented views (Contrastive Learning)
             image_x_view1 = self.transform(image_x)
             image_x_view2 = self.transform(image_x)
 
-            # Generate a unique key for the batch dictionary
-            key_parts = video_key.replace('\\', '/').split('/')
-            key_name = f"{key_parts[-1]}"  # e.g. "live", "cutout"
-
-            sample[key_name] = {
+            sample[class_name] = {
                 "image_x_v1": image_x_view1,
                 "image_x_v2": image_x_view2,
                 "label": spoofing_label,
@@ -214,6 +240,7 @@ class BalanceFaceDataset(Dataset):
         return sample
 
     def sample_image(self, image_dir):
+        # Standard sampling from the folder
         frames = [f for f in os.listdir(image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
         if len(frames) == 0:
             return Image.new('RGB', (224, 224))
