@@ -4,7 +4,8 @@ import os
 
 # 1. Define the path to your log file
 # Based on your previous run, it should be here:
-file_path = '/content/Domain-Invariance-Vision-Transformer/GD-FAS/results/Run_Fold1/Custom_to_Custom.txt'
+# file_path = '/content/Domain-Invariance-Vision-Transformer/GD-FAS/results/Run_Fold1/Custom_to_Custom.txt'
+file_path = './results/c_to_c.txt'
 
 # 2. Storage for the data
 epochs = []

@@ -1,4 +1,5 @@
 
+python training.py --backbone clip --gs --temperature 0.1 --num_classes 3 --protocol c_to_c --data_root dataset --log_name Run_CeFA_MultiClass
 
 python training.py --backbone clip --gs --temperature 0.1 --protocol C_FAS_to_C_FAS --save --log_name MyCustomFAS_Run --data_root dataset
 
